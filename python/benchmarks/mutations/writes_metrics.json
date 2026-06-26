@@ -1,0 +1,54 @@
+{
+  "scale": 100000,
+  "fragments": 4,
+  "runs": 3,
+  "workloads": {
+    "point_delete": {
+      "mdb_p50_ms": 30.387,
+      "mdb_p95_ms": 38.8405,
+      "duckdb_p50_ms": 6.123,
+      "duckdb_p95_ms": 8.7251,
+      "ratio_vs_duckdb": 4.4516,
+      "mdb_cold_p95_ms": 93.0746,
+      "duckdb_cold_p95_ms": 8.2518
+    },
+    "point_update": {
+      "mdb_p50_ms": 59.8798,
+      "mdb_p95_ms": 74.4162,
+      "duckdb_p50_ms": 7.1754,
+      "duckdb_p95_ms": 7.594,
+      "ratio_vs_duckdb": 9.7994,
+      "mdb_cold_p95_ms": 163.6145,
+      "duckdb_cold_p95_ms": 8.9958
+    },
+    "bulk_delete_1pct": {
+      "mdb_p50_ms": 172.0748,
+      "mdb_p95_ms": 195.1714,
+      "duckdb_p50_ms": 8.9941,
+      "duckdb_p95_ms": 9.607,
+      "ratio_vs_duckdb": 20.3155,
+      "mdb_cold_p95_ms": 217.1886,
+      "duckdb_cold_p95_ms": 9.4195
+    },
+    "bulk_update_1pct": {
+      "mdb_p50_ms": 186.5827,
+      "mdb_p95_ms": 219.8225,
+      "duckdb_p50_ms": 6.9098,
+      "duckdb_p95_ms": 7.9519,
+      "ratio_vs_duckdb": 27.6442,
+      "mdb_cold_p95_ms": 258.3628,
+      "duckdb_cold_p95_ms": 6.957
+    },
+    "merge_upsert": {
+      "mdb_p50_ms": 176.6435,
+      "mdb_p95_ms": 179.5049,
+      "duckdb_p50_ms": 14.8822,
+      "duckdb_p95_ms": 16.8836,
+      "ratio_vs_duckdb": 10.6319,
+      "mdb_cold_p95_ms": 259.9849,
+      "duckdb_cold_p95_ms": 18.386
+    }
+  },
+  "open_p50_ms": 51.7955,
+  "open_p95_ms": 76.2834
+}

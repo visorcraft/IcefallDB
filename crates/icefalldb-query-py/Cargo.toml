@@ -1,0 +1,28 @@
+[package]
+name = "icefalldb-query-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "icefalldb_query_py"
+crate-type = ["cdylib"]
+
+[features]
+# Encryption is on by default so the built extension can read and write
+# Parquet-Modular-Encryption tables out of the box.
+default = ["encryption"]
+encryption = ["icefalldb-query/encryption", "icefalldb-core/encryption"]
+
+[dependencies]
+icefalldb-core = { path = "../icefalldb-core" }
+icefalldb-query = { path = "../icefalldb-query" }
+datafusion = "54.0.0"
+# `json` (arrow-json) and serde_json are already in the workspace tree
+# (transitive via icefalldb-core/-query); enabling them here adds no new crate.
+# Used only by the optional `server=` thin-client path.
+arrow = { version = "58", features = ["pyarrow", "json"] }
+serde_json = "1"
+pyo3 = { version = "0.28", features = ["extension-module"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }

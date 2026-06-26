@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "crates/icefalldb-core",
+    "crates/icefalldb-cli",
+    "crates/icefalldb-query",
+    "crates/icefalldb-query-py",
+    "crates/icefalldb-server",
+    "crates/datafusion-encrypted-parquet",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.10.2"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.80"

@@ -1,0 +1,47 @@
+[package]
+name = "icefalldb-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+icefalldb-core = { path = "../icefalldb-core" }
+datafusion = "54.0.0"
+datafusion-datasource = "54.0.0"
+datafusion-datasource-parquet = "54.0.0"
+datafusion-execution = "54.0.0"
+arrow = "58"
+parquet = { version = "58", features = ["arrow", "zstd", "object_store"] }
+object_store = "0.13"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "fs", "io-util", "macros", "sync", "time"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+futures = "0.3"
+bytes = "1"
+base64 = "0.22"
+sha2 = "0.11"
+hex = "0.4"
+tracing = "0.1"
+datasketches = { version = "0.3.0", features = ["cpc", "tdigest"], optional = true }
+
+[features]
+default = []
+# Enable transparent decryption of Parquet Modular Encryption-encrypted tables.
+# Requires icefalldb-core's `encryption` feature (which adds `parquet/encryption`
+# and `ring`) and DataFusion's `parquet_encryption` feature (which adds
+# `FileDecryptionProperties` support to `ParquetSource`).
+encryption = [
+    "icefalldb-core/encryption",
+    "datafusion/parquet_encryption",
+    "datafusion-datasource-parquet/parquet_encryption",
+    "datafusion-execution/parquet_encryption",
+    "parquet/encryption",
+]
+sketches = ["dep:datasketches", "icefalldb-core/sketches"]
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
+criterion = { version = "0.8", features = ["async_tokio"] }

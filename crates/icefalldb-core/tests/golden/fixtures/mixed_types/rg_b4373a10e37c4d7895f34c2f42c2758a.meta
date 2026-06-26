@@ -1,0 +1,29 @@
+{
+  "row_group": "rg_b4373a10e37c4d7895f34c2f42c2758a",
+  "schema_id": 1,
+  "rows": 3,
+  "columns": {
+    "id": {
+      "min": 1,
+      "max": 3,
+      "nulls": 0
+    },
+    "label": {
+      "min": "a",
+      "max": "b",
+      "nulls": 1
+    },
+    "active": {
+      "min": false,
+      "max": true,
+      "nulls": 0
+    },
+    "value": {
+      "min": 1.5,
+      "max": 3.0,
+      "nulls": 1
+    }
+  },
+  "checksum": "sha256:81ac527a80fd04a75b5b4629b3d2ea0a10a0e22fd07f26f3a361340f415002e4",
+  "meta_checksum": "sha256:96caa77e52ad6281ebcdae8e1bd5954476cc5586568207e80604efdf903cd183"
+}

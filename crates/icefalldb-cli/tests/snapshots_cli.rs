@@ -1,0 +1,145 @@
+use arrow::array::Int64Array;
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use arrow::record_batch::RecordBatch;
+use icefalldb_core::metadata::{Column, Schema};
+use icefalldb_core::storage::local::LocalStorage;
+use icefalldb_core::writer::Writer;
+use std::process::Command;
+use std::sync::Arc;
+
+fn icefalldb_bin() -> std::path::PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_icefalldb")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let mut path = std::env::current_exe().unwrap();
+            path.pop(); // deps
+            path.pop(); // debug or release
+            path.push("icefalldb");
+            path
+        })
+}
+
+/// Run icefalldb CLI with the given args and return stdout as a string.
+/// Panics with stderr on failure.
+fn run_cli(args: &[&str]) -> String {
+    let output = Command::new(icefalldb_bin())
+        .args(args)
+        .output()
+        .expect("failed to run icefalldb");
+    assert!(
+        output.status.success(),
+        "icefalldb {:?} failed:\nstderr: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn make_schema() -> Schema {
+    Schema {
+        schema_id: 1,
+        columns: vec![Column {
+            name: "id".into(),
+            r#type: "int64".into(),
+            nullable: false,
+            field_id: 1,
+        }],
+        partition_by: None,
+        sort: None,
+        agg_group_keys: None,
+        row_group_target_rows: 1_000_000,
+        row_group_target_bytes: 134_217_728,
+        max_field_id: 1,
+        dropped_columns: vec![],
+    }
+}
+
+fn make_batch(ids: Vec<i64>) -> RecordBatch {
+    let schema = ArrowSchema::new(vec![Field::new("id", DataType::Int64, false)]);
+    let array = Int64Array::from(ids);
+    RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap()
+}
+
+/// Build a table with two inserts (seq 1 and seq 2).
+/// Returns (TempDir, db_path_string).
+async fn setup_cli_table_two_inserts() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path();
+
+    let storage = LocalStorage::new(db).unwrap();
+
+    // First insert — snapshot sequence 1.
+    let mut writer = Writer::new(Arc::new(storage.clone()), "bench", make_schema())
+        .await
+        .unwrap();
+    writer
+        .insert_batch(make_batch(vec![1, 2, 3]))
+        .await
+        .unwrap();
+    writer.commit().await.unwrap();
+
+    // Second insert — snapshot sequence 2.
+    let mut writer2 = Writer::new(Arc::new(storage), "bench", make_schema())
+        .await
+        .unwrap();
+    writer2
+        .insert_batch(make_batch(vec![4, 5, 6]))
+        .await
+        .unwrap();
+    writer2.commit().await.unwrap();
+
+    let db_str = db.to_str().unwrap().to_string();
+    (tmp, db_str)
+}
+
+#[tokio::test]
+async fn snapshots_lists_history() {
+    let (_tmp, db) = setup_cli_table_two_inserts().await;
+    let out = run_cli(&["snapshots", &db, "bench"]);
+    // Must contain the header row and at least 2 data rows.
+    assert!(
+        out.contains("sequence"),
+        "expected header with 'sequence', got:\n{out}"
+    );
+    let data_lines: Vec<&str> = out
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.contains("sequence"))
+        .collect();
+    assert!(
+        data_lines.len() >= 2,
+        "expected >=2 snapshot rows, got {}:\n{out}",
+        data_lines.len()
+    );
+}
+
+#[tokio::test]
+async fn snapshots_empty_table_shows_no_snapshots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path();
+
+    // Create table with no inserts.
+    let storage = LocalStorage::new(db).unwrap();
+    Writer::create(Arc::new(storage), "empty_table", make_schema())
+        .await
+        .unwrap();
+
+    let db_str = db.to_str().unwrap().to_string();
+    let out = run_cli(&["snapshots", &db_str, "empty_table"]);
+    // A created-but-never-inserted table has no committed snapshots: the command
+    // must take the "(no snapshots)" branch, not merely print the always-present
+    // header (the old `contains("sequence")` check was vacuously true).
+    assert!(
+        out.contains("(no snapshots)"),
+        "expected the (no snapshots) branch for a never-inserted table, got:\n{out}"
+    );
+    // And there must be zero snapshot data rows (only the header + the note).
+    let data_lines: Vec<&str> = out
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.contains("sequence") && !l.contains("no snapshots"))
+        .collect();
+    assert!(
+        data_lines.is_empty(),
+        "expected zero snapshot rows, got {}:\n{out}",
+        data_lines.len()
+    );
+}

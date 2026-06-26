@@ -1,0 +1,62 @@
+[package]
+name = "icefalldb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+arrow = "58"
+parquet = { version = "58", features = ["arrow", "zstd"] }
+tokio = { version = "1", features = ["rt", "fs", "io-util", "macros", "sync", "time"] }
+async-trait = "0.1"
+fs2 = "0.4"
+futures = "0.3"
+bytes = "1"
+base64 = "0.22"
+roaring = "0.11"
+memmap2 = "0.9"
+# Zero-copy archive for the derived snapshot-checkpoint cache (Task 4.1) — the
+# only new runtime dependency this plan adds.
+rkyv = "0.8"
+tracing = "0.1"
+object_store = { version = "0.13", features = ["aws"], optional = true }
+apache-avro = { version = "0.21", optional = true }
+# Encryption (optional, opt-in via the `encryption` feature).
+zeroize = { version = "1.9", optional = true, features = ["alloc"] }
+datasketches = { version = "0.3.0", features = ["cpc", "tdigest"], optional = true }
+
+[features]
+default = ["iceberg"]
+s3 = ["dep:object_store"]
+iceberg = ["dep:apache-avro"]
+# Enable Parquet Modular Encryption (Apache Parquet 2.9+) for at-rest
+# encryption of row-group files. Adds `ring` (AES-GCM) via `parquet/encryption`.
+encryption = ["parquet/encryption", "dep:zeroize"]
+sketches = ["dep:datasketches"]
+
+[[test]]
+name = "golden_generate"
+path = "tests/golden/generate.rs"
+
+[[test]]
+name = "golden_read"
+path = "tests/golden/read.rs"
+
+[[bench]]
+name = "benchmarks"
+harness = false
+
+[[example]]
+name = "retract_crossover"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
+criterion = { version = "0.8", features = ["async_tokio"] }

@@ -1,0 +1,12 @@
+{
+  "schema_id": 1,
+  "columns": [
+    {
+      "name": "id",
+      "type": "int64",
+      "nullable": false
+    }
+  ],
+  "row_group_target_rows": 1000,
+  "row_group_target_bytes": 1048576
+}

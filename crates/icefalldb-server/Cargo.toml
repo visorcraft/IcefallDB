@@ -1,0 +1,31 @@
+[package]
+name = "icefalldb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "icefalldb-server"
+path = "src/main.rs"
+
+[dependencies]
+icefalldb-core = { path = "../icefalldb-core" }
+icefalldb-query = { path = "../icefalldb-query" }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+arrow = { version = "58", features = ["json"] }
+datafusion = "54.0.0"
+sqlparser = "0.62"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+num_cpus = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+reqwest = { version = "0.13", features = ["json"] }
+tempfile = "3"

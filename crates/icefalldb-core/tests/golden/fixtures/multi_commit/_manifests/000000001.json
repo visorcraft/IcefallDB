@@ -1,0 +1,12 @@
+{
+  "format_version": 1,
+  "sequence": 1,
+  "schema_id": 1,
+  "row_groups": [
+    {
+      "data": "rg_d12a85dcd7c84a47bd16cf18481c98de.parquet",
+      "meta": "rg_d12a85dcd7c84a47bd16cf18481c98de.meta"
+    }
+  ],
+  "checksum": "sha256:651a77c722808eaaab1eb3d844a8e7455cb1d7e1123ea57b80105852fda924d3"
+}

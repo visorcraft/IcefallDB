@@ -1,0 +1,20 @@
+{
+  "format_version": 1,
+  "sequence": 1,
+  "schema_id": 1,
+  "row_groups": [
+    {
+      "data": "rg_969c8370e5784beca47a4e2c23be9c91.parquet",
+      "meta": "rg_969c8370e5784beca47a4e2c23be9c91.meta"
+    },
+    {
+      "data": "rg_95b7fe51a9ce4c1daa5cd7d358a52236.parquet",
+      "meta": "rg_95b7fe51a9ce4c1daa5cd7d358a52236.meta"
+    },
+    {
+      "data": "rg_666a45fc84564ab89547c8d882f53990.parquet",
+      "meta": "rg_666a45fc84564ab89547c8d882f53990.meta"
+    }
+  ],
+  "checksum": "sha256:6d5bfb1166ad5bc3317b3376ca6e58a4f103734253a9de4e50759f2d039ea5fa"
+}

@@ -1,0 +1,14 @@
+{
+  "row_group": "rg_666a45fc84564ab89547c8d882f53990",
+  "schema_id": 1,
+  "rows": 1,
+  "columns": {
+    "id": {
+      "min": 5,
+      "max": 5,
+      "nulls": 0
+    }
+  },
+  "checksum": "sha256:8a5bc55ae5f42949c37e225acccb91d6446fe0c674333b87b5dffd9c45471e2d",
+  "meta_checksum": "sha256:62ed994b59fae3a8d7e407f852020af63a8b7af3c5965fdafbb623290624dd38"
+}

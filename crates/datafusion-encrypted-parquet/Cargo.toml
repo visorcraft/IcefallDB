@@ -1,0 +1,37 @@
+[package]
+name = "datafusion-encrypted-parquet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Turnkey Parquet Modular Encryption for DataFusion's ParquetFormat / ParquetSource"
+
+[dependencies]
+datafusion = { version = "54.0.0", default-features = false, features = ["parquet"] }
+datafusion-common = "54.0.0"
+datafusion-execution = "54.0.0"
+datafusion-datasource = "54.0.0"
+datafusion-datasource-parquet = "54.0.0"
+parquet = { version = "58", default-features = false, features = ["arrow"] }
+arrow = "58"
+object_store = "0.13"
+async-trait = "0.1"
+thiserror = "2"
+tracing = "0.1"
+base64 = "0.22"
+
+[features]
+default = []
+# Enable the underlying Parquet Modular Encryption support. When this is off,
+# the crate's API surface compiles but the encryption factory returns an error
+# at runtime so callers get a clear "feature not enabled" message rather than
+# a confusing link error.
+encryption = [
+    "datafusion/parquet_encryption",
+    "datafusion-datasource-parquet/parquet_encryption",
+    "datafusion-execution/parquet_encryption",
+    "parquet/encryption",
+]
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

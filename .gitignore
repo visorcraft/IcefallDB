@@ -1,0 +1,24 @@
+.worktrees/
+target/
+PLAN.md
+AGENTS.md
+CLAUDE.md
+/.claude/
+/docs/superpowers/
+
+# Python adapter
+python/.venv/
+python/build/
+python/dist/
+**/__pycache__/
+*.egg-info/
+*.pyc
+*.whl
+.pytest_cache/
+
+# Build artifacts
+*.so
+.superpowers/
+
+# Query result cache directories (never commit)
+_query_cache/

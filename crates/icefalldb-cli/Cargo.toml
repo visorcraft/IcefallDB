@@ -1,0 +1,39 @@
+[package]
+name = "icefalldb-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "icefalldb"
+path = "src/main.rs"
+
+[features]
+# Encryption is on by default so the shipped `icefalldb` binary can create and
+# read Parquet-Modular-Encryption tables out of the box. Turn it off with
+# `--no-default-features` for a smaller build without the `ring`/AES-GCM deps.
+default = ["encryption"]
+encryption = ["icefalldb-query/encryption", "icefalldb-core/encryption"]
+
+[dependencies]
+icefalldb-core = { path = "../icefalldb-core", features = ["iceberg"] }
+icefalldb-query = { path = "../icefalldb-query" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+anyhow = "1"
+arrow = "58"
+parquet = { version = "58", features = ["arrow", "zstd"] }
+bytes = "1"
+serde_json = "1"
+tempfile = "3"
+chrono = "0.4"
+futures = "0.3"
+which = "8"
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+arrow = "58"
+parquet = { version = "58", features = ["arrow", "zstd"] }
+serde_json = "1"
+futures = "0.3"

@@ -1,0 +1,66 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">IcefallDB mark</title>
+  <desc id="desc">Faceted glacier blocks falling into a crystalline database cylinder.</desc>
+  <defs>
+    <linearGradient id="iceTop" x1="95" y1="44" x2="414" y2="420" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F7FFFF"/>
+      <stop offset="0.28" stop-color="#91F1FF"/>
+      <stop offset="0.62" stop-color="#26B8FF"/>
+      <stop offset="1" stop-color="#2545D9"/>
+    </linearGradient>
+    <linearGradient id="deepIce" x1="118" y1="181" x2="385" y2="452" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#DDFBFF"/>
+      <stop offset="0.38" stop-color="#2DD7FF"/>
+      <stop offset="1" stop-color="#192E89"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="105" y1="244" x2="407" y2="244" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="0.45" stop-color="#6DEAFF"/>
+      <stop offset="1" stop-color="#3079FF"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(260 293) rotate(90) scale(220 230)">
+      <stop stop-color="#7CF7FF" stop-opacity="0.56"/>
+      <stop offset="0.7" stop-color="#2788FF" stop-opacity="0.15"/>
+      <stop offset="1" stop-color="#061128" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.19 0 0 0 0 0.86 0 0 0 0 1 0 0 0 0.9 0" result="glow"/>
+      <feMerge>
+        <feMergeNode in="glow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#031027" flood-opacity="0.52"/>
+    </filter>
+  </defs>
+  <circle cx="256" cy="282" r="222" fill="url(#glow)"/>
+  <g filter="url(#shadow)">
+    <path d="M113 244C113 207.5 399 207.5 399 244V360C399 398.5 113 398.5 113 360V244Z" fill="url(#deepIce)" fill-opacity="0.78"/>
+    <path d="M113 244C113 280.5 399 280.5 399 244" stroke="#E8FDFF" stroke-width="8" stroke-linecap="round" opacity="0.94"/>
+    <ellipse cx="256" cy="244" rx="143" ry="43" fill="#0F2C5D" fill-opacity="0.92" stroke="url(#rim)" stroke-width="10"/>
+    <ellipse cx="256" cy="244" rx="99" ry="25" fill="#DFFBFF" fill-opacity="0.17" stroke="#7CF6FF" stroke-opacity="0.62" stroke-width="3"/>
+    <path d="M122 310C163 340 348 340 390 309" stroke="#A9F6FF" stroke-width="5" stroke-opacity="0.55" stroke-linecap="round"/>
+    <path d="M125 357C168 389 344 389 387 357" stroke="#FFFFFF" stroke-width="5" stroke-opacity="0.38" stroke-linecap="round"/>
+    <path d="M187 224L205 375" stroke="#E8FFFF" stroke-width="4" stroke-opacity="0.28"/>
+    <path d="M325 224L307 375" stroke="#E8FFFF" stroke-width="4" stroke-opacity="0.22"/>
+  </g>
+  <g filter="url(#softGlow)" stroke-linejoin="round">
+    <path d="M146 132L228 72L326 113L279 205L165 196L146 132Z" fill="url(#iceTop)" stroke="#F3FFFF" stroke-width="7"/>
+    <path d="M228 72L230 154L326 113" stroke="#FFFFFF" stroke-opacity="0.58" stroke-width="4"/>
+    <path d="M230 154L279 205" stroke="#0D85D8" stroke-opacity="0.45" stroke-width="4"/>
+    <path d="M164 196L230 154L146 132" stroke="#B7F8FF" stroke-opacity="0.62" stroke-width="4"/>
+    <path d="M267 44L351 72L386 141L316 119L267 44Z" fill="url(#iceTop)" stroke="#F3FFFF" stroke-width="6" opacity="0.95"/>
+    <path d="M318 167L410 178L392 237L301 223L318 167Z" fill="url(#iceTop)" stroke="#E9FFFF" stroke-width="6" opacity="0.92"/>
+    <path d="M96 185L161 159L207 220L125 241L96 185Z" fill="url(#iceTop)" stroke="#ECFFFF" stroke-width="6" opacity="0.92"/>
+  </g>
+  <g opacity="0.8">
+    <path d="M253 205V231" stroke="#EFFFFF" stroke-width="5" stroke-linecap="round"/>
+    <path d="M286 211V236" stroke="#80F7FF" stroke-width="4" stroke-linecap="round"/>
+    <path d="M217 205V231" stroke="#80F7FF" stroke-width="4" stroke-linecap="round"/>
+    <circle cx="253" cy="232" r="5" fill="#EFFFFF"/>
+    <circle cx="286" cy="237" r="4" fill="#80F7FF"/>
+    <circle cx="217" cy="232" r="4" fill="#80F7FF"/>
+  </g>
+</svg>

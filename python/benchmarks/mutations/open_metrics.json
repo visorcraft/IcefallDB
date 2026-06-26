@@ -1,0 +1,32 @@
+{
+  "frags_low": 10,
+  "frags_high": 2000,
+  "repeats": 20,
+  "segs_low": 10,
+  "segs_high": 2000,
+  "mmap_open": {
+    "low_p95_ms": 0.01882,
+    "high_p95_ms": 0.016368,
+    "ratio": 0.869739
+  },
+  "addressmap_eager_open": {
+    "low_p95_ms": 0.014186,
+    "high_p95_ms": 0.096602,
+    "ratio": 6.809592
+  },
+  "n_rows": 100000,
+  "mutation_volume": 9892,
+  "n_deleted": 4936,
+  "n_updated": 4956,
+  "pre_scan_mdb_p95_ms": 65.447414,
+  "pre_filter_mdb_p95_ms": 4.27972,
+  "pre_point_lookup_mdb_p95_ms": 52.567167,
+  "post_scan_mdb_p95_ms": 59.083785,
+  "post_scan_duck_p95_ms": 22.342521,
+  "post_filter_mdb_p95_ms": 2.339404,
+  "post_filter_duck_p95_ms": 1.431226,
+  "count_star_mdb_p95_ms": 6.510012,
+  "count_star_duck_p95_ms": 0.590884,
+  "post_point_lookup_mdb_p95_ms": 51.73422,
+  "post_point_lookup_duck_p95_ms": 1.261962
+}
