@@ -273,15 +273,17 @@ impl<'a> Checker<'a> {
         // A mismatched AAD prefix is a serious integrity problem; report it as
         // an error rather than silently skipping encrypted validation.
         let expected_aad = table_aad_prefix(&self.table, schema_id);
-        let stored_aad = marker
-            .aad_prefix
-            .as_ref()
-            .map(|b64| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(b64)
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default();
+        let stored_aad = match marker.aad_prefix.as_ref() {
+            Some(b64) => base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| {
+                    crate::IcefallDBError::Encryption(format!(
+                        "invalid AAD prefix base64 in _encryption.json for table '{}': {}",
+                        self.table, e
+                    ))
+                })?,
+            None => Vec::new(),
+        };
         if !stored_aad.is_empty() && stored_aad != expected_aad {
             return Err(crate::IcefallDBError::Encryption(format!(
                 "_encryption.json AAD prefix does not match table '{}': expected {:?}, got {:?}",
@@ -550,7 +552,9 @@ impl<'a> Checker<'a> {
                     .await
                 {
                     Ok(Some(props)) => (Some(props), false),
-                    Ok(None) | Err(_) => (None, true),
+                    Ok(None) => (None, true),
+                    Err(crate::IcefallDBError::EncryptionKeyNotFound(_)) => (None, true),
+                    Err(e) => return Err(e),
                 }
             } else {
                 (None, true)

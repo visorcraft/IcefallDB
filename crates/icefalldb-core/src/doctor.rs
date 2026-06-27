@@ -584,6 +584,7 @@ impl<'a> Doctor<'a> {
                     self.storage
                         .write(&meta_path, &serde_json::to_vec(&meta)?)
                         .await?;
+                    self.storage.sync(&meta_path).await?;
                     any_regenerated = true;
                     actions.push(RepairAction {
                         kind: ActionKind::Regenerated,
