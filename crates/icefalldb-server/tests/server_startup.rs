@@ -47,12 +47,33 @@ async fn smoke_startup_binds() {
         .await
         .expect("failed to start server on ephemeral port");
 
-    // Give the server a moment to start serving; it should be near-instant.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Poll `/tables` until the server is actually serving, up to 5 seconds.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut last_status = None;
+    let resp = loop {
+        match reqwest::get(format!("{base_url}/tables")).await {
+            Ok(resp) if resp.status().is_success() => break resp,
+            Ok(resp) => {
+                last_status = Some(resp.status());
+                if tokio::time::Instant::now() > deadline {
+                    panic!(
+                        "GET /tables did not return success within 5s; last status: {:?}",
+                        last_status
+                    );
+                }
+            }
+            Err(_) => {
+                if tokio::time::Instant::now() > deadline {
+                    panic!(
+                        "GET /tables did not return success within 5s; last status: {:?}",
+                        last_status
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
 
-    let resp = reqwest::get(format!("{base_url}/tables"))
-        .await
-        .expect("failed to GET /tables");
     assert!(
         resp.status().is_success(),
         "GET /tables returned {}",
