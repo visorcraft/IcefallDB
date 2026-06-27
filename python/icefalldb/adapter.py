@@ -1734,6 +1734,11 @@ def attach(
     tables with active deletion vectors automatically fall back to the native
     engine for correctness.
 
+    Set ``engine="duckdb"`` to force a direct DuckDB connection. This is allowed
+    only for plaintext tables without active deletion vectors or a pending
+    mutation WAL; DuckDB reads the raw Parquet files and cannot apply IcefallDB's
+    deletion semantics.
+
     Set `verify_data_checksums=False` to skip the per-row-group SHA-256 data
     checksum verification on attach. This speeds up read-heavy workloads where
     the caller trusts the stored metadata checksums; corruption can still be
@@ -1790,6 +1795,12 @@ def attach(
                     f"table '{_tname}' is encrypted; engine='duckdb' cannot read it. "
                     "Use the default engine or engine='datafusion' with the key "
                     "(ICEFALLDB_KEY_* env vars or key_file=)."
+                )
+            if _table_has_active_deletions(db_path, _tname):
+                raise IcefallDBError(
+                    f"table '{_tname}' has active deletion vectors or a pending "
+                    "mutation WAL; engine='duckdb' cannot read it correctly. "
+                    "Use the default engine or engine='datafusion'."
                 )
 
     if engine == "datafusion" or snapshot is not None:
@@ -1859,7 +1870,8 @@ def attach_table(
 
     Set ``engine="datafusion"`` to use the native DataFusion query engine via the
     ``icefalldb query`` CLI, or ``engine="icefalldb"`` to route SELECTs through
-    DuckDB and mutations through the native engine.
+    DuckDB and mutations through the native engine. Explicit ``engine="duckdb"``
+    rejects encrypted tables and tables with active deletion vectors.
     """
     return attach(
         db_path,

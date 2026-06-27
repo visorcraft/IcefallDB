@@ -332,6 +332,84 @@ def test_hybrid_deletion_vector_guard(sample_db):
     assert rows == [(4,)]
 
 
+def _assert_explicit_duckdb_rejects_dirty_table(db: Path, table: str) -> None:
+    assert _table_has_active_deletions(db, table) is True
+
+    with pytest.raises(IcefallDBError, match="active deletion vectors"):
+        icefalldb.attach(str(db), tables=[table], engine="duckdb")
+
+    with pytest.raises(IcefallDBError, match="active deletion vectors"):
+        icefalldb.attach_table(str(db), table, engine="duckdb")
+
+
+def test_explicit_duckdb_rejects_deleted_rows(sample_db):
+    """Explicit DuckDB must fail rather than expose deletion-vector tombstones."""
+    if not _native_available():
+        pytest.skip("native DataFusion extension required for mutation tests")
+
+    con = icefalldb.attach(str(sample_db), tables=["events"], engine="icefalldb")
+    con.mutate("DELETE FROM events WHERE id = 1")
+
+    _assert_explicit_duckdb_rejects_dirty_table(sample_db, "events")
+    assert con.sql("SELECT COUNT(*) AS cnt FROM events").fetchall() == [(7,)]
+
+    native = icefalldb.attach(str(sample_db), tables=["events"], engine="datafusion")
+    assert native.sql("SELECT id FROM events ORDER BY id").fetchall() == [
+        (2,),
+        (3,),
+        (4,),
+        (5,),
+        (6,),
+        (7,),
+        (8,),
+    ]
+
+
+def test_explicit_duckdb_rejects_updated_rows(sample_db):
+    """Explicit DuckDB must fail rather than expose update pre-images."""
+    if not _native_available():
+        pytest.skip("native DataFusion extension required for mutation tests")
+
+    con = icefalldb.attach(str(sample_db), tables=["events"], engine="icefalldb")
+    con.mutate("UPDATE events SET value = 999.0 WHERE id = 2")
+
+    _assert_explicit_duckdb_rejects_dirty_table(sample_db, "events")
+    assert con.sql("SELECT COUNT(*) AS cnt FROM events").fetchall() == [(8,)]
+    assert con.sql("SELECT value FROM events WHERE id = 2").fetchall() == [(999.0,)]
+
+    native = icefalldb.attach(str(sample_db), tables=["events"], engine="datafusion")
+    assert native.sql("SELECT value FROM events WHERE id = 2").fetchall() == [(999.0,)]
+
+
+def test_explicit_duckdb_rejects_merge_updated_rows(sample_db):
+    """Explicit DuckDB must fail rather than expose MERGE update pre-images."""
+    if not _native_available():
+        pytest.skip("native DataFusion extension required for mutation tests")
+
+    _run_icefalldb("create-index", "--unique", str(sample_db), "events", "id")
+    con = icefalldb.attach(str(sample_db), tables=["events"], engine="icefalldb")
+    con.mutate(
+        "MERGE INTO events USING "
+        "(VALUES (2, 'merged', 222.0), (9, 'new', 90.0)) AS src(id, category, value) "
+        "ON events.id = src.id "
+        "WHEN MATCHED THEN UPDATE SET "
+        "id = src.id, category = src.category, value = src.value "
+        "WHEN NOT MATCHED THEN INSERT (id, category, value) "
+        "VALUES (src.id, src.category, src.value)"
+    )
+
+    _assert_explicit_duckdb_rejects_dirty_table(sample_db, "events")
+    assert con.sql("SELECT COUNT(*) AS cnt FROM events").fetchall() == [(9,)]
+    assert con.sql("SELECT category, value FROM events WHERE id = 2").fetchall() == [
+        ("merged", 222.0)
+    ]
+
+    native = icefalldb.attach(str(sample_db), tables=["events"], engine="datafusion")
+    assert native.sql("SELECT category, value FROM events WHERE id = 9").fetchall() == [
+        ("new", 90.0)
+    ]
+
+
 def test_hybrid_delete_correctness_via_native(sample_db):
     """Rows deleted through hybrid stay deleted; survivors are intact."""
     if not _native_available():
