@@ -7,6 +7,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+// These WAL/crash-recovery tests do heavy fsync + manifest-replay I/O against a
+// shared process; running them serially (rather than 5-wide) keeps them robust
+// under load instead of intermittently failing when the host is contended.
+use serial_test::serial;
+
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use icefalldb_core::catalog::Catalog;
@@ -71,6 +76,7 @@ async fn setup_with_deferred_delete(storage: Arc<dyn Storage>, table: &str) {
 }
 
 #[tokio::test]
+#[serial]
 async fn deferred_delete_does_not_swap_pointer_but_is_visible_via_replay() {
     let tmp = tempfile::tempdir().unwrap();
     let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()).unwrap());
@@ -104,6 +110,7 @@ async fn deferred_delete_does_not_swap_pointer_but_is_visible_via_replay() {
 }
 
 #[tokio::test]
+#[serial]
 async fn checkpoint_folds_deferred_delete_into_a_normal_manifest() {
     let tmp = tempfile::tempdir().unwrap();
     let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()).unwrap());
@@ -130,6 +137,7 @@ async fn checkpoint_folds_deferred_delete_into_a_normal_manifest() {
 }
 
 #[tokio::test]
+#[serial]
 async fn gc_with_pending_wal_checkpoints_first_and_keeps_the_deletion_vector() {
     // The data-loss guard: GC computes its referenced set from the pointer
     // manifest. With a pending WAL it must checkpoint first, otherwise it would
@@ -161,6 +169,7 @@ async fn gc_with_pending_wal_checkpoints_first_and_keeps_the_deletion_vector() {
 }
 
 #[tokio::test]
+#[serial]
 async fn crash_losing_the_unsynced_del_file_is_recovered_from_the_inlined_record() {
     // In WAL mode the .del file is written without its own fsync; durability is
     // the inlined record. Simulate a crash that lost the un-fsynced .del, then a
@@ -190,6 +199,7 @@ async fn crash_losing_the_unsynced_del_file_is_recovered_from_the_inlined_record
 }
 
 #[tokio::test]
+#[serial]
 async fn second_deferred_delete_builds_on_the_first() {
     let tmp = tempfile::tempdir().unwrap();
     let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()).unwrap());
