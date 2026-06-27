@@ -24,7 +24,8 @@ use tokio::io::AsyncReadExt;
 
 #[cfg(feature = "encryption")]
 use crate::encryption::{
-    build_encryption_properties, EncryptionWriteConfig, SchemaEncryptionMarker,
+    build_decryption_properties, build_encryption_properties, EncryptionWriteConfig,
+    SchemaEncryptionMarker,
 };
 
 fn other<E: std::error::Error + Send + Sync + 'static>(err: E) -> IcefallDBError {
@@ -3611,6 +3612,13 @@ impl Writer {
         txn_id: &str,
         incremental_append: bool,
     ) -> Result<Vec<String>> {
+        #[cfg(feature = "encryption")]
+        let index_decryption = self
+            .encryption
+            .as_ref()
+            .map(|enc| build_decryption_properties(&enc.keys))
+            .transpose()?;
+
         let index_paths = if incremental_append {
             // Pure append: scan only the fragments this commit added and write an
             // adds-only index delta, instead of re-serializing each index over the
@@ -3627,17 +3635,46 @@ impl Writer {
                 .filter(|rg| !prior.contains(rg.data.as_str()))
                 .cloned()
                 .collect();
-            IndexMaintainer::maintain_on_insert(
-                self.storage.clone(),
-                &self.table,
-                manifest,
-                &current_manifest.index_generations,
-                &new_fragments,
-                manifest.sequence,
-            )
-            .await?
+            #[cfg(feature = "encryption")]
+            {
+                IndexMaintainer::maintain_on_insert_with_decryption(
+                    self.storage.clone(),
+                    &self.table,
+                    manifest,
+                    &current_manifest.index_generations,
+                    &new_fragments,
+                    manifest.sequence,
+                    index_decryption.clone(),
+                )
+                .await?
+            }
+            #[cfg(not(feature = "encryption"))]
+            {
+                IndexMaintainer::maintain_on_insert(
+                    self.storage.clone(),
+                    &self.table,
+                    manifest,
+                    &current_manifest.index_generations,
+                    &new_fragments,
+                    manifest.sequence,
+                )
+                .await?
+            }
         } else {
-            IndexMaintainer::maintain(self.storage.clone(), &self.table, manifest).await?
+            #[cfg(feature = "encryption")]
+            {
+                IndexMaintainer::maintain_with_decryption(
+                    self.storage.clone(),
+                    &self.table,
+                    manifest,
+                    index_decryption,
+                )
+                .await?
+            }
+            #[cfg(not(feature = "encryption"))]
+            {
+                IndexMaintainer::maintain(self.storage.clone(), &self.table, manifest).await?
+            }
         };
 
         // Rewrite the intent so its `files` list covers both the row group

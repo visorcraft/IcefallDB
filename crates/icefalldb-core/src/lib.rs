@@ -43,6 +43,8 @@ pub use doctor::{
 pub(crate) use error::is_not_found;
 pub use error::{IcefallDBError, Result};
 pub use gc::{GarbageCollector, GcResult};
+#[cfg(feature = "encryption")]
+pub use index::build_btree_index_with_decryption;
 pub use index::{
     append_tombstones, build_btree_index, list_index_names, load_index, load_index_by_ref,
     resolve_live_addresses, resolve_live_addresses_storage, BTreeIndex, IndexDefinition,

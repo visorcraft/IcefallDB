@@ -11,13 +11,13 @@ use icefalldb_core::metadata::{Column, Schema};
 use icefalldb_core::storage::local::LocalStorage;
 use icefalldb_core::storage::Storage;
 use icefalldb_core::writer::validate_table;
-#[cfg(feature = "encryption")]
-use icefalldb_core::WriterOptionsFull;
 use icefalldb_core::{
     build_btree_index, list_snapshots, Checker, Compactor, DatabaseCatalog, Doctor,
     GarbageCollector, IcefallDBError, IndexDefinition, InsertParquetOutcome, Reader, TsvDecoder,
     TsvEncoder, Writer,
 };
+#[cfg(feature = "encryption")]
+use icefalldb_core::{build_btree_index_with_decryption, WriterOptionsFull};
 #[cfg(feature = "encryption")]
 use icefalldb_query::icefalldb_encrypted_session;
 use icefalldb_query::result_cache::{is_cacheable_select, EvictPolicy, ResultCache};
@@ -94,6 +94,10 @@ enum Commands {
         db: PathBuf,
         table: String,
         file: PathBuf,
+        /// JSON key file for reading an encrypted table. Default: read keys
+        /// from `ICEFALLDB_KEY_*` environment variables.
+        #[arg(long, value_name = "PATH")]
+        key_file: Option<PathBuf>,
     },
     /// Validate a IcefallDB table.
     Check {
@@ -157,6 +161,10 @@ enum Commands {
         /// Mark the index as unique (required for MERGE key indexes).
         #[arg(long)]
         unique: bool,
+        /// JSON key file for indexing an encrypted table. Default: read keys
+        /// from `ICEFALLDB_KEY_*` environment variables.
+        #[arg(long, value_name = "PATH")]
+        key_file: Option<PathBuf>,
     },
     /// Create a materialized view definition.
     CreateView {
@@ -331,7 +339,12 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Commands::Export { db, table, file } => match run_export(&db, &table, &file).await {
+        Commands::Export {
+            db,
+            table,
+            file,
+            key_file,
+        } => match run_export(&db, &table, &file, key_file.as_deref()).await {
             Ok(rows) => {
                 println!("exported {} rows from {}", rows, table);
                 ExitCode::from(0)
@@ -423,8 +436,17 @@ fn main() -> ExitCode {
             name,
             index_type,
             unique,
-        } => match run_create_index(&db, &table, &column, name.as_deref(), &index_type, unique)
-            .await
+            key_file,
+        } => match run_create_index(
+            &db,
+            &table,
+            &column,
+            name.as_deref(),
+            &index_type,
+            unique,
+            key_file.as_deref(),
+        )
+        .await
         {
             Ok(()) => ExitCode::from(0),
             Err(e) => {
@@ -874,7 +896,12 @@ async fn run_import(
     Ok(total_rows)
 }
 
-async fn run_export(db: &Path, table: &str, file: &Path) -> anyhow::Result<usize> {
+async fn run_export(
+    db: &Path,
+    table: &str,
+    file: &Path,
+    key_file: Option<&Path>,
+) -> anyhow::Result<usize> {
     validate_table(table)?;
 
     let storage: Arc<dyn Storage> = Arc::new(
@@ -891,6 +918,25 @@ async fn run_export(db: &Path, table: &str, file: &Path) -> anyhow::Result<usize
             table
         )
     })?;
+
+    #[cfg(feature = "encryption")]
+    if let Some(marker) = encryption::read_marker(&storage, table).await? {
+        return run_export_encrypted(&storage, table, file, key_file, &marker, arrow_schema).await;
+    }
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = key_file;
+        if storage
+            .exists(&format!("{}/_encryption.json", table))
+            .await?
+        {
+            anyhow::bail!(
+                "table '{}' is encrypted but this `icefalldb` build was compiled \
+                 without the `encryption` feature",
+                table
+            );
+        }
+    }
 
     let mut batches: Vec<RecordBatch> = Vec::new();
     let manifest_pointer_path = format!("{}/_manifest.json", table);
@@ -929,6 +975,54 @@ async fn run_export(db: &Path, table: &str, file: &Path) -> anyhow::Result<usize
         .await
         .with_context(|| format!("writing TSV file {}", file.display()))?;
 
+    Ok(total_rows)
+}
+
+#[cfg(feature = "encryption")]
+async fn run_export_encrypted(
+    storage: &Arc<dyn Storage>,
+    table: &str,
+    file: &Path,
+    key_file: Option<&Path>,
+    marker: &icefalldb_core::encryption::SchemaEncryptionMarker,
+    arrow_schema: arrow::datatypes::Schema,
+) -> anyhow::Result<usize> {
+    let provider_config = provider_config_from_env_or_default()?;
+    let key_provider = encryption::provider_from(key_file);
+    let ctx = icefalldb_encrypted_session(
+        std::cmp::max(1, provider_config.target_partitions),
+        provider_config.batch_size,
+        Arc::clone(&key_provider),
+    );
+    let provider = encryption::open_encrypted_provider(
+        storage,
+        table,
+        provider_config,
+        Arc::clone(&key_provider),
+        marker,
+    )
+    .await?;
+    ctx.register_table(table, Arc::new(provider))
+        .map_err(|e| anyhow::anyhow!("registering encrypted table '{}': {}", table, e))?;
+
+    let escaped_table = table.replace('"', "\"\"");
+    let df = ctx
+        .sql(&format!("SELECT * FROM \"{escaped_table}\""))
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let batches = df.collect().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let batch = if batches.is_empty() {
+        RecordBatch::new_empty(Arc::new(arrow_schema))
+    } else {
+        arrow::compute::concat_batches(&Arc::new(arrow_schema), &batches)
+            .context("concatenating encrypted export batches")?
+    };
+    let total_rows = batch.num_rows();
+
+    let tsv = TsvEncoder::encode(&batch);
+    tokio::fs::write(file, tsv)
+        .await
+        .with_context(|| format!("writing TSV file {}", file.display()))?;
     Ok(total_rows)
 }
 
@@ -1449,6 +1543,7 @@ async fn run_create_index(
     name: Option<&str>,
     index_type: &str,
     unique: bool,
+    key_file: Option<&Path>,
 ) -> anyhow::Result<()> {
     validate_table(table)?;
 
@@ -1499,12 +1594,69 @@ async fn run_create_index(
             column: column.to_string(),
             unique,
         };
-        Some(
-            build_btree_index(storage.as_ref(), &definition, &manifest)
-                .await
-                .with_context(|| format!("building index '{}' for table '{}'", name, table))?,
-        )
+        #[cfg(feature = "encryption")]
+        {
+            if let Some(marker) = encryption::read_marker(&storage, table).await? {
+                if marker.column_key_ids.is_empty() || marker.column_key_ids.contains_key(column) {
+                    let key_provider = encryption::provider_from(key_file);
+                    let decryption = encryption::decryption_properties_for_columns(
+                        key_provider,
+                        &marker,
+                        [column],
+                    )
+                    .await?;
+                    Some(
+                        build_btree_index_with_decryption(
+                            storage.as_ref(),
+                            &definition,
+                            &manifest,
+                            Some(decryption),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("building index '{}' for table '{}'", name, table)
+                        })?,
+                    )
+                } else {
+                    Some(
+                        build_btree_index(storage.as_ref(), &definition, &manifest)
+                            .await
+                            .with_context(|| {
+                                format!("building index '{}' for table '{}'", name, table)
+                            })?,
+                    )
+                }
+            } else {
+                Some(
+                    build_btree_index(storage.as_ref(), &definition, &manifest)
+                        .await
+                        .with_context(|| {
+                            format!("building index '{}' for table '{}'", name, table)
+                        })?,
+                )
+            }
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = key_file;
+            if storage
+                .exists(&format!("{}/_encryption.json", table))
+                .await?
+            {
+                anyhow::bail!(
+                    "table '{}' is encrypted but this `icefalldb` build was compiled \
+                     without the `encryption` feature",
+                    table
+                );
+            }
+            Some(
+                build_btree_index(storage.as_ref(), &definition, &manifest)
+                    .await
+                    .with_context(|| format!("building index '{}' for table '{}'", name, table))?,
+            )
+        }
     } else {
+        let _ = key_file;
         None
     };
 
@@ -1939,16 +2091,6 @@ async fn run_query_encrypted(
     {
         anyhow::bail!("--snapshot is read-only; mutations are not allowed on a past snapshot");
     }
-    if sql_upper.starts_with("DELETE")
-        || sql_upper.starts_with("UPDATE")
-        || sql_upper.starts_with("MERGE")
-    {
-        anyhow::bail!(
-            "mutations on encrypted tables are not yet supported via the CLI; \
-             encrypted tables are currently read-only from `icefalldb query`"
-        );
-    }
-
     let provider_config = provider_config_from_env_or_default()?;
     let key_provider = encryption::provider_from(key_file);
     let ctx = icefalldb_encrypted_session(
@@ -2006,6 +2148,28 @@ async fn run_query_encrypted(
             ctx.register_table(table, Arc::new(provider))
                 .map_err(|e| anyhow::anyhow!("registering table '{}': {}", table, e))?;
         }
+    }
+
+    if snapshot.is_none() && sql_upper.starts_with("DELETE") && tables.len() == 1 {
+        let affected = execute_sql(&ctx, Arc::clone(storage), &tables[0], sql)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        eprintln!("{affected} row(s) deleted");
+        return Ok(());
+    }
+    if snapshot.is_none() && sql_upper.starts_with("UPDATE") && tables.len() == 1 {
+        let affected = execute_sql(&ctx, Arc::clone(storage), &tables[0], sql)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        eprintln!("{affected} row(s) updated");
+        return Ok(());
+    }
+    if snapshot.is_none() && sql_upper.starts_with("MERGE") && tables.len() == 1 {
+        let affected = execute_sql(&ctx, Arc::clone(storage), &tables[0], sql)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        eprintln!("{affected} row(s) affected");
+        return Ok(());
     }
 
     let df = ctx.sql(sql).await.map_err(|e| anyhow::anyhow!("{}", e))?;

@@ -108,6 +108,193 @@ fn encrypted_import_and_query_roundtrip() {
 }
 
 #[test]
+fn encrypted_export_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("db");
+    let tsv = tmp.path().join("orders.tsv");
+    let exported = tmp.path().join("exported.tsv");
+    std::fs::write(
+        &tsv,
+        "order_id\tcategory\tamount\n1\tbooks\t10\n2\tgames\t20\n3\tbooks\t30\n",
+    )
+    .unwrap();
+    let key = "000102030405060708090a0b0c0d0e0f";
+
+    let imp = Command::new(bin())
+        .args([
+            "import",
+            db.to_str().unwrap(),
+            "orders",
+            tsv.to_str().unwrap(),
+            "--encrypt",
+        ])
+        .env("ICEFALLDB_KEY_ORDERS_V1", key)
+        .output()
+        .unwrap();
+    assert!(
+        imp.status.success(),
+        "import: {}",
+        String::from_utf8_lossy(&imp.stderr)
+    );
+
+    let out = Command::new(bin())
+        .args([
+            "export",
+            db.to_str().unwrap(),
+            "orders",
+            exported.to_str().unwrap(),
+        ])
+        .env("ICEFALLDB_KEY_ORDERS_V1", key)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "export failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("exported 3 rows"));
+    let text = std::fs::read_to_string(&exported).unwrap();
+    assert!(text.contains("order_id\tcategory\tamount"), "{text}");
+    assert!(text.contains("1\tbooks\t10"), "{text}");
+    assert!(text.contains("2\tgames\t20"), "{text}");
+    assert!(text.contains("3\tbooks\t30"), "{text}");
+
+    let no_key_path = tmp.path().join("no-key.tsv");
+    let no_key = Command::new(bin())
+        .args([
+            "export",
+            db.to_str().unwrap(),
+            "orders",
+            no_key_path.to_str().unwrap(),
+        ])
+        .env_remove("ICEFALLDB_KEY_ORDERS_V1")
+        .output()
+        .unwrap();
+    assert!(!no_key.status.success(), "export without key succeeded");
+    assert!(
+        String::from_utf8_lossy(&no_key.stderr).contains("encryption key not found"),
+        "stderr: {}",
+        String::from_utf8_lossy(&no_key.stderr)
+    );
+}
+
+#[test]
+fn encrypted_query_mutations_and_merge_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("db");
+    let tsv = tmp.path().join("orders.tsv");
+    std::fs::write(
+        &tsv,
+        "order_id\tcategory\tamount\n1\tbooks\t10\n2\tgames\t20\n3\tbooks\t30\n",
+    )
+    .unwrap();
+    let key = "000102030405060708090a0b0c0d0e0f";
+
+    let imp = Command::new(bin())
+        .args([
+            "import",
+            db.to_str().unwrap(),
+            "orders",
+            tsv.to_str().unwrap(),
+            "--encrypt",
+        ])
+        .env("ICEFALLDB_KEY_ORDERS_V1", key)
+        .output()
+        .unwrap();
+    assert!(
+        imp.status.success(),
+        "import: {}",
+        String::from_utf8_lossy(&imp.stderr)
+    );
+
+    let idx = Command::new(bin())
+        .args([
+            "create-index",
+            "--unique",
+            db.to_str().unwrap(),
+            "orders",
+            "order_id",
+        ])
+        .env("ICEFALLDB_KEY_ORDERS_V1", key)
+        .output()
+        .unwrap();
+    assert!(
+        idx.status.success(),
+        "create-index: {}",
+        String::from_utf8_lossy(&idx.stderr)
+    );
+
+    let table_dir = db.join("orders");
+    let del = Command::new(bin())
+        .args([
+            "query",
+            table_dir.to_str().unwrap(),
+            "DELETE FROM orders WHERE order_id = 1",
+        ])
+        .env("ICEFALLDB_KEY_ORDERS_V1", key)
+        .output()
+        .unwrap();
+    assert!(
+        del.status.success(),
+        "DELETE: {}",
+        String::from_utf8_lossy(&del.stderr)
+    );
+
+    let upd = Command::new(bin())
+        .args([
+            "query",
+            table_dir.to_str().unwrap(),
+            "UPDATE orders SET amount = 88 WHERE order_id = 2",
+        ])
+        .env("ICEFALLDB_KEY_ORDERS_V1", key)
+        .output()
+        .unwrap();
+    assert!(
+        upd.status.success(),
+        "UPDATE: {}",
+        String::from_utf8_lossy(&upd.stderr)
+    );
+
+    let merge_sql = "MERGE INTO orders USING \
+        (VALUES (2, 'games', 90), (4, 'games', 40)) AS src(order_id, category, amount) \
+        ON orders.order_id = src.order_id \
+        WHEN MATCHED THEN UPDATE SET order_id = src.order_id, category = src.category, amount = src.amount \
+        WHEN NOT MATCHED THEN INSERT (order_id, category, amount) VALUES (src.order_id, src.category, src.amount)";
+    let merge = Command::new(bin())
+        .args(["query", table_dir.to_str().unwrap(), merge_sql])
+        .env("ICEFALLDB_KEY_ORDERS_V1", key)
+        .output()
+        .unwrap();
+    assert!(
+        merge.status.success(),
+        "MERGE: {}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
+
+    let out = Command::new(bin())
+        .args([
+            "query",
+            table_dir.to_str().unwrap(),
+            "SELECT order_id, category, amount FROM orders ORDER BY order_id",
+            "--format",
+            "csv",
+        ])
+        .env("ICEFALLDB_KEY_ORDERS_V1", key)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "query: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("1,books,10"), "{stdout}");
+    assert!(stdout.contains("2,games,90"), "{stdout}");
+    assert!(stdout.contains("3,books,30"), "{stdout}");
+    assert!(stdout.contains("4,games,40"), "{stdout}");
+}
+
+#[test]
 fn encrypted_stats_not_leaked_in_plaintext_sidecars() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("db");

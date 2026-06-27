@@ -29,7 +29,7 @@ use datafusion::sql::sqlparser::ast::{
 };
 use icefalldb_core::database_catalog::DatabaseCatalog;
 use icefalldb_core::storage::Storage;
-use icefalldb_core::{CommitDelta, MatchLoc, Writer};
+use icefalldb_core::{CommitDelta, MatchLoc, Writer, WriterOptionsFull};
 
 use crate::{IcefallDBTableProvider, QueryError, Result};
 use icefalldb_core::IcefallDBError;
@@ -271,6 +271,54 @@ async fn apply_delta_to_provider(
             QueryError::Other("registered provider is not a IcefallDBTableProvider".into())
         })?;
     provider.apply_committed_delta(delta).await
+}
+
+async fn mutation_writer(
+    ctx: &SessionContext,
+    storage: Arc<dyn Storage>,
+    table_root: &str,
+    table_name: &str,
+    schema: icefalldb_core::metadata::Schema,
+) -> Result<Writer> {
+    let provider = match ctx.table_provider(table_name).await {
+        Ok(provider) => provider,
+        Err(_) => ctx
+            .table_provider(table_root)
+            .await
+            .map_err(|e| QueryError::Other(format!("table not registered: {e}")))?,
+    };
+    let provider = (provider.as_ref() as &dyn std::any::Any)
+        .downcast_ref::<IcefallDBTableProvider>()
+        .ok_or_else(|| {
+            QueryError::Other("registered provider is not a IcefallDBTableProvider".into())
+        })?;
+    let wal_mode = std::env::var("ICEFALLDB_WAL")
+        .map(|v| v == "1")
+        .unwrap_or(provider.config().wal_mode);
+
+    #[cfg(feature = "encryption")]
+    let writer = if let Some(resolver) = provider.encryption_resolver() {
+        let cfg = resolver.resolve_write_config().await?;
+        Writer::new_with_full(
+            Arc::clone(&storage),
+            table_root,
+            schema,
+            WriterOptionsFull::new().with_encryption(cfg),
+        )
+        .await
+        .map_err(QueryError::Core)?
+    } else {
+        Writer::new(Arc::clone(&storage), table_root, schema)
+            .await
+            .map_err(QueryError::Core)?
+    };
+
+    #[cfg(not(feature = "encryption"))]
+    let writer = Writer::new(Arc::clone(&storage), table_root, schema)
+        .await
+        .map_err(QueryError::Core)?;
+
+    Ok(writer.with_wal_mode(wal_mode))
 }
 
 /// Locate all live rows in `table` that satisfy `predicate`.
@@ -940,11 +988,7 @@ async fn execute_merge_to_delta(
     // Insert batch for unmatched rows (empty batch when none unmatched).
     let insert_batch = record_batch_from_rows(&unmatched_rows, src.schema())?;
 
-    let wal_mode = resolve_wal_mode(ctx, table).await;
-    let writer = Writer::new(Arc::clone(&storage), table_root, schema)
-        .await
-        .map_err(QueryError::Core)?;
-    let mut writer = writer.with_wal_mode(wal_mode);
+    let mut writer = mutation_writer(ctx, Arc::clone(&storage), table_root, table, schema).await?;
     let delta = writer
         .commit_merge(matched_batch, matched_locs, &set_columns, insert_batch)
         .await
@@ -1846,25 +1890,6 @@ async fn execute_delete(
 
 /// Commit a `DELETE` and return the affected-row count and delta without
 /// refreshing the registered provider.
-/// Resolve deferred-commit (mutation WAL) mode for a mutation on `table`.
-///
-/// Source of truth is the registered provider's [`ProviderConfig::wal_mode`]
-/// (default `true`). The `ICEFALLDB_WAL` env var, when set, overrides it
-/// (`1`/`0`) — intended for A/B benchmarking only.
-async fn resolve_wal_mode(ctx: &SessionContext, table: &str) -> bool {
-    if let Ok(v) = std::env::var("ICEFALLDB_WAL") {
-        return v == "1";
-    }
-    if let Ok(provider) = ctx.table_provider(table).await {
-        if let Some(mp) =
-            (provider.as_ref() as &dyn std::any::Any).downcast_ref::<IcefallDBTableProvider>()
-        {
-            return mp.config().wal_mode;
-        }
-    }
-    true
-}
-
 async fn execute_delete_to_delta(
     ctx: &SessionContext,
     storage: Arc<dyn Storage>,
@@ -1919,11 +1944,8 @@ async fn execute_delete_to_delta(
         .ok_or_else(|| QueryError::Other(format!("no schema found for table '{table_root}'")))?;
 
     // Commit the deletion vectors and advance the manifest.
-    let wal_mode = resolve_wal_mode(ctx, &table_name).await;
-    let writer = Writer::new(Arc::clone(&storage), table_root, schema)
-        .await
-        .map_err(QueryError::Core)?;
-    let mut writer = writer.with_wal_mode(wal_mode);
+    let mut writer =
+        mutation_writer(ctx, Arc::clone(&storage), table_root, &table_name, schema).await?;
     let delta = writer
         .commit_deletes(by_fragment)
         .await
@@ -2076,11 +2098,8 @@ async fn execute_update_to_delta(
     // Commit the update: write the patch fragment, tombstone the originals,
     // advance the row-index delta, and incrementally maintain indexes for the
     // SET columns.
-    let wal_mode = resolve_wal_mode(ctx, &table_name).await;
-    let writer = Writer::new(Arc::clone(&storage), table_root, schema)
-        .await
-        .map_err(QueryError::Core)?;
-    let mut writer = writer.with_wal_mode(wal_mode);
+    let mut writer =
+        mutation_writer(ctx, Arc::clone(&storage), table_root, &table_name, schema).await?;
     let delta = writer
         .commit_update(ub.rows, ub.locs, &set_columns)
         .await

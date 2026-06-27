@@ -23,6 +23,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 anyhow = "1"
 arrow = "58"
 parquet = { version = "58", features = ["arrow", "zstd"] }
+base64 = "0.22"
 bytes = "1"
 serde_json = "1"
 tempfile = "3"

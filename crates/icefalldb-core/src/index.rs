@@ -10,9 +10,15 @@ use arrow::array::{Array, AsArray};
 use arrow::datatypes::DataType;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ProjectionMask;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+#[cfg(feature = "encryption")]
+use parquet::arrow::arrow_reader::ArrowReaderOptions;
+#[cfg(feature = "encryption")]
+use parquet::encryption::decrypt::FileDecryptionProperties;
 
 /// Derived, optional binary postings format (mmap-friendly) written alongside
 /// the canonical JSON index. See [`binary`] for the layout and fallback rules.
@@ -673,6 +679,31 @@ pub async fn build_btree_index(
     manifest: &Manifest,
 ) -> Result<BTreeIndex> {
     let adds = collect_index_adds_for_fragments(storage, definition, &manifest.row_groups).await?;
+    build_btree_index_from_adds(definition, manifest.sequence, adds)
+}
+
+#[cfg(feature = "encryption")]
+pub async fn build_btree_index_with_decryption(
+    storage: &dyn Storage,
+    definition: &IndexDefinition,
+    manifest: &Manifest,
+    decryption: Option<Arc<FileDecryptionProperties>>,
+) -> Result<BTreeIndex> {
+    let adds = collect_index_adds_for_fragments_with_decryption(
+        storage,
+        definition,
+        &manifest.row_groups,
+        decryption,
+    )
+    .await?;
+    build_btree_index_from_adds(definition, manifest.sequence, adds)
+}
+
+fn build_btree_index_from_adds(
+    definition: &IndexDefinition,
+    snapshot_sequence: u64,
+    adds: Vec<(String, u64)>,
+) -> Result<BTreeIndex> {
     let mut entries: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for (key, row_id) in adds {
         entries.entry(key).or_default().push(row_id);
@@ -697,7 +728,7 @@ pub async fn build_btree_index(
 
     Ok(BTreeIndex {
         definition: definition.clone(),
-        snapshot_sequence: manifest.sequence,
+        snapshot_sequence,
         entries,
     })
 }
@@ -712,6 +743,32 @@ async fn collect_index_adds_for_fragments(
     storage: &dyn Storage,
     definition: &IndexDefinition,
     fragments: &[crate::metadata::manifest::RowGroupEntry],
+) -> Result<Vec<(String, u64)>> {
+    #[cfg(feature = "encryption")]
+    {
+        collect_index_adds_for_fragments_inner(storage, definition, fragments, None).await
+    }
+    #[cfg(not(feature = "encryption"))]
+    {
+        collect_index_adds_for_fragments_inner(storage, definition, fragments).await
+    }
+}
+
+#[cfg(feature = "encryption")]
+async fn collect_index_adds_for_fragments_with_decryption(
+    storage: &dyn Storage,
+    definition: &IndexDefinition,
+    fragments: &[crate::metadata::manifest::RowGroupEntry],
+    decryption: Option<Arc<FileDecryptionProperties>>,
+) -> Result<Vec<(String, u64)>> {
+    collect_index_adds_for_fragments_inner(storage, definition, fragments, decryption).await
+}
+
+async fn collect_index_adds_for_fragments_inner(
+    storage: &dyn Storage,
+    definition: &IndexDefinition,
+    fragments: &[crate::metadata::manifest::RowGroupEntry],
+    #[cfg(feature = "encryption")] decryption: Option<Arc<FileDecryptionProperties>>,
 ) -> Result<Vec<(String, u64)>> {
     let mut adds: Vec<(String, u64)> = Vec::new();
 
@@ -748,8 +805,31 @@ async fn collect_index_adds_for_fragments(
 
         // TODO: use RowGroupMeta column_offsets to read only the indexed column.
         let data = storage.read(&data_path).await?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(data)).map_err(other)?;
-        let batches = reader.build().map_err(other)?;
+        let parquet_bytes = Bytes::from(data);
+        let reader = {
+            #[cfg(feature = "encryption")]
+            {
+                if let Some(props) = decryption.as_ref() {
+                    ParquetRecordBatchReaderBuilder::try_new_with_options(
+                        parquet_bytes,
+                        ArrowReaderOptions::new()
+                            .with_file_decryption_properties(Arc::clone(props)),
+                    )
+                } else {
+                    ParquetRecordBatchReaderBuilder::try_new(parquet_bytes)
+                }
+            }
+            #[cfg(not(feature = "encryption"))]
+            {
+                ParquetRecordBatchReaderBuilder::try_new(parquet_bytes)
+            }
+        }
+        .map_err(other)?;
+        let col_idx = reader.schema().index_of(&definition.column).map_err(|_| {
+            IcefallDBError::Other(format!("column {} not found", definition.column).into())
+        })?;
+        let projection = ProjectionMask::roots(reader.parquet_schema(), [col_idx]);
+        let batches = reader.with_projection(projection).build().map_err(other)?;
 
         let mut physical_offset: u32 = 0;
         for batch in batches {
@@ -962,6 +1042,32 @@ impl IndexMaintainer {
         table: &str,
         manifest: &mut Manifest,
     ) -> Result<Vec<String>> {
+        #[cfg(feature = "encryption")]
+        {
+            Self::maintain_inner(storage, table, manifest, None).await
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            Self::maintain_inner(storage, table, manifest).await
+        }
+    }
+
+    #[cfg(feature = "encryption")]
+    pub async fn maintain_with_decryption(
+        storage: Arc<dyn Storage>,
+        table: &str,
+        manifest: &mut Manifest,
+        decryption: Option<Arc<FileDecryptionProperties>>,
+    ) -> Result<Vec<String>> {
+        Self::maintain_inner(storage, table, manifest, decryption).await
+    }
+
+    async fn maintain_inner(
+        storage: Arc<dyn Storage>,
+        table: &str,
+        manifest: &mut Manifest,
+        #[cfg(feature = "encryption")] decryption: Option<Arc<FileDecryptionProperties>>,
+    ) -> Result<Vec<String>> {
         let catalog = DatabaseCatalog::new(storage.clone());
         let data = catalog.load().await?;
         let mut written_paths = Vec::new();
@@ -975,6 +1081,15 @@ impl IndexMaintainer {
                 column: entry.column,
                 unique: entry.unique,
             };
+            #[cfg(feature = "encryption")]
+            let index = build_btree_index_with_decryption(
+                storage.as_ref(),
+                &definition,
+                manifest,
+                decryption.clone(),
+            )
+            .await?;
+            #[cfg(not(feature = "encryption"))]
             let index = build_btree_index(storage.as_ref(), &definition, manifest).await?;
             let rel_path = index.save_versioned(storage.as_ref()).await?;
             written_paths.push(rel_path.clone());
@@ -1145,6 +1260,64 @@ impl IndexMaintainer {
         new_fragments: &[crate::metadata::manifest::RowGroupEntry],
         seq: u64,
     ) -> Result<Vec<String>> {
+        #[cfg(feature = "encryption")]
+        {
+            Self::maintain_on_insert_inner(
+                storage,
+                table,
+                manifest,
+                current_index_generations,
+                new_fragments,
+                seq,
+                None,
+            )
+            .await
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            Self::maintain_on_insert_inner(
+                storage,
+                table,
+                manifest,
+                current_index_generations,
+                new_fragments,
+                seq,
+            )
+            .await
+        }
+    }
+
+    #[cfg(feature = "encryption")]
+    pub async fn maintain_on_insert_with_decryption(
+        storage: Arc<dyn Storage>,
+        table: &str,
+        manifest: &mut Manifest,
+        current_index_generations: &std::collections::HashMap<String, IndexRef>,
+        new_fragments: &[crate::metadata::manifest::RowGroupEntry],
+        seq: u64,
+        decryption: Option<Arc<FileDecryptionProperties>>,
+    ) -> Result<Vec<String>> {
+        Self::maintain_on_insert_inner(
+            storage,
+            table,
+            manifest,
+            current_index_generations,
+            new_fragments,
+            seq,
+            decryption,
+        )
+        .await
+    }
+
+    async fn maintain_on_insert_inner(
+        storage: Arc<dyn Storage>,
+        table: &str,
+        manifest: &mut Manifest,
+        current_index_generations: &std::collections::HashMap<String, IndexRef>,
+        new_fragments: &[crate::metadata::manifest::RowGroupEntry],
+        seq: u64,
+        #[cfg(feature = "encryption")] decryption: Option<Arc<FileDecryptionProperties>>,
+    ) -> Result<Vec<String>> {
         let catalog = DatabaseCatalog::new(storage.clone());
         let data = catalog.load().await?;
         let mut written_paths = Vec::new();
@@ -1180,6 +1353,15 @@ impl IndexMaintainer {
 
             // No base anywhere → one-time full build to establish it.
             let Some(current_ref) = current_ref.filter(|r| r.base.is_some()) else {
+                #[cfg(feature = "encryption")]
+                let index = build_btree_index_with_decryption(
+                    storage.as_ref(),
+                    &definition,
+                    manifest,
+                    decryption.clone(),
+                )
+                .await?;
+                #[cfg(not(feature = "encryption"))]
                 let index = build_btree_index(storage.as_ref(), &definition, manifest).await?;
                 let rel_path = index.save_versioned(storage.as_ref()).await?;
                 written_paths.push(rel_path.clone());
@@ -1194,6 +1376,15 @@ impl IndexMaintainer {
             };
 
             // Adds-only delta over just the new fragments.
+            #[cfg(feature = "encryption")]
+            let adds = collect_index_adds_for_fragments_with_decryption(
+                storage.as_ref(),
+                &definition,
+                new_fragments,
+                decryption.clone(),
+            )
+            .await?;
+            #[cfg(not(feature = "encryption"))]
             let adds =
                 collect_index_adds_for_fragments(storage.as_ref(), &definition, new_fragments)
                     .await?;

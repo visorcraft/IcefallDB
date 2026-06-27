@@ -34,8 +34,8 @@ use datafusion::common::config::EncryptionFactoryOptions;
 use datafusion::common::DataFusionError;
 use datafusion_execution::parquet_encryption::EncryptionFactory;
 use icefalldb_core::encryption::{
-    build_decryption_properties, table_aad_prefix, EncryptionKeySet, KeyIdentifier, KeyProvider,
-    Zeroizing,
+    build_decryption_properties, table_aad_prefix, EncryptionKeySet, EncryptionWriteConfig,
+    KeyIdentifier, KeyProvider, Zeroizing,
 };
 use object_store::path::Path as ObjectStorePath;
 
@@ -307,6 +307,40 @@ impl EncryptionKeyResolver {
             EncryptionKeySet::with_columns_zeroizing(footer_bytes, column_keys, self.aad.clone())
                 .map_err(map_enc_err)?;
         build_decryption_properties(&key_set).map_err(map_enc_err)
+    }
+
+    /// Resolve every key needed to write a new fragment for this encrypted
+    /// table, preserving the table's stored encryption mode.
+    pub async fn resolve_write_config(&self) -> Result<EncryptionWriteConfig> {
+        let footer = self
+            .provider
+            .get(&self.footer_key_id, &self.aad)
+            .await
+            .map_err(map_enc_err)?;
+        let mut column_keys: std::collections::BTreeMap<String, Zeroizing<Vec<u8>>> =
+            std::collections::BTreeMap::new();
+        for (name, kid) in &self.column_key_ids {
+            let key = self
+                .provider
+                .get(kid, &self.aad)
+                .await
+                .map_err(map_enc_err)?;
+            column_keys.insert(name.clone(), Zeroizing::new(key.as_slice().to_vec()));
+        }
+
+        let footer = Zeroizing::new(footer.as_slice().to_vec());
+        let key_set = if column_keys.is_empty() {
+            EncryptionKeySet::footer_only_zeroizing(footer, self.aad.clone())
+        } else {
+            EncryptionKeySet::with_columns_zeroizing(footer, column_keys, self.aad.clone())
+        }
+        .map_err(map_enc_err)?;
+        let mut cfg =
+            EncryptionWriteConfig::new(key_set).with_plaintext_footer(self.plaintext_footer);
+        if !self.column_key_ids.is_empty() {
+            cfg = cfg.with_encrypted_columns(self.column_key_ids.keys().cloned());
+        }
+        Ok(cfg)
     }
 }
 

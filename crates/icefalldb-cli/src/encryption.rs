@@ -13,9 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use base64::Engine;
 use icefalldb_core::encryption::{
-    table_aad_prefix, EncryptionKeySet, EncryptionWriteConfig, EnvKeyProvider, FileKeyProvider,
-    KeyIdentifier, KeyProvider, SchemaEncryptionMarker,
+    build_decryption_properties, table_aad_prefix, EncryptionKeySet, EncryptionWriteConfig,
+    EnvKeyProvider, FileKeyProvider, KeyIdentifier, KeyProvider, SchemaEncryptionMarker,
 };
 use icefalldb_core::storage::Storage;
 use icefalldb_query::{IcefallDBTableProvider, ProviderConfig};
@@ -160,4 +161,56 @@ pub async fn open_encrypted_provider_at_snapshot(
     )
     .await
     .map_err(|e| anyhow!("opening encrypted table '{table}' at snapshot {sequence}: {e}"))
+}
+
+/// Build Parquet decryption properties for a projected index scan.
+///
+/// For whole-table encryption, the footer key is enough. For per-column
+/// encryption, callers pass only the encrypted columns they need so unrelated
+/// column keys are not required.
+pub async fn decryption_properties_for_columns<I, S>(
+    key_provider: Arc<dyn KeyProvider>,
+    marker: &SchemaEncryptionMarker,
+    encrypted_columns: I,
+) -> Result<Arc<parquet::encryption::decrypt::FileDecryptionProperties>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let aad = match marker.aad_prefix.as_deref() {
+        Some(b64) => base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| anyhow!("invalid AAD prefix in _encryption.json: {e}"))?,
+        None => Vec::new(),
+    };
+
+    let footer_id = KeyIdentifier::new(marker.footer_key_id.clone());
+    let footer = key_provider
+        .get(&footer_id, &aad)
+        .await
+        .with_context(|| format!("resolving footer key '{footer_id}'"))?;
+
+    let mut columns = BTreeMap::new();
+    for col in encrypted_columns {
+        let col = col.as_ref();
+        if let Some(kid) = marker.column_key_ids.get(col) {
+            let key_id = KeyIdentifier::new(kid.clone());
+            let key = key_provider
+                .get(&key_id, &aad)
+                .await
+                .with_context(|| format!("resolving column key '{key_id}'"))?;
+            columns.insert(col.to_string(), key);
+        }
+    }
+
+    let key_set = if columns.is_empty() {
+        EncryptionKeySet::footer_only_zeroizing(footer, aad)
+            .map_err(|e| anyhow!("invalid footer key: {e}"))?
+    } else {
+        EncryptionKeySet::with_columns_zeroizing(footer, columns, aad)
+            .map_err(|e| anyhow!("invalid key set: {e}"))?
+    };
+
+    build_decryption_properties(&key_set)
+        .map_err(|e| anyhow!("building decryption properties: {e}"))
 }

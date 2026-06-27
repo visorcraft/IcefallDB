@@ -9,6 +9,7 @@ an encryption-enabled CLI binary are available.
 import json
 import os
 import pathlib
+import subprocess
 
 import pytest
 
@@ -35,7 +36,7 @@ def _locate_cli():
     if env and pathlib.Path(env).exists():
         return env
     repo = pathlib.Path(__file__).resolve().parents[2]
-    for profile in ("release", "debug"):
+    for profile in ("debug", "release"):
         cand = repo / "target" / profile / "icefalldb"
         if cand.exists():
             return str(cand)
@@ -179,3 +180,32 @@ def test_encrypted_table_time_travel_is_read_only(tmp_path, monkeypatch):
 
     with pytest.raises(Exception):
         asof.mutate("DELETE FROM orders WHERE order_id = 1")
+
+
+def test_encrypted_live_mutations_roundtrip(tmp_path, monkeypatch):
+    db = _make_table(tmp_path, monkeypatch, encrypt=True)
+
+    subprocess.run(
+        [_CLI, "create-index", "--unique", str(db), "orders", "order_id"],
+        check=True,
+        env=os.environ.copy(),
+    )
+
+    con = icefalldb.attach(str(db), engine="datafusion")
+    assert con.mutate("DELETE FROM orders WHERE order_id = 1") == 1
+    assert con.mutate("UPDATE orders SET amount = 88.0 WHERE order_id = 2") == 1
+    assert (
+        con.mutate(
+            "MERGE INTO orders USING "
+            "(VALUES (2, 'games', 90.0), (4, 'games', 40.0)) AS src(order_id, category, amount) "
+            "ON orders.order_id = src.order_id "
+            "WHEN MATCHED THEN UPDATE SET order_id = src.order_id, category = src.category, amount = src.amount "
+            "WHEN NOT MATCHED THEN INSERT (order_id, category, amount) VALUES (src.order_id, src.category, src.amount)"
+        )
+        == 2
+    )
+
+    rows = con.sql(
+        "SELECT order_id, category, amount FROM orders ORDER BY order_id"
+    ).fetchall()
+    assert rows == [(2, "games", 90.0), (3, "books", 14.0), (4, "games", 40.0)]
