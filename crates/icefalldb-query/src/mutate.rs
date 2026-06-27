@@ -1044,6 +1044,19 @@ fn data_column_names(schema: &arrow::datatypes::SchemaRef) -> HashSet<String> {
         .collect()
 }
 
+/// Normalize a SQL identifier to match DataFusion's resolution rules.
+///
+/// Unquoted identifiers are folded to lowercase; quoted identifiers are kept
+/// verbatim so that uppercase or mixed-case names written with quotes still
+/// resolve to the column that was declared with that exact casing.
+fn normalize_sql_identifier(ident: &datafusion::sql::sqlparser::ast::Ident) -> String {
+    if ident.quote_style.is_none() {
+        ident.value.to_lowercase()
+    } else {
+        ident.value.clone()
+    }
+}
+
 /// Validate that every UPDATE SET target exists in the table's data schema.
 fn validate_update_targets(
     table_name: &str,
@@ -1082,7 +1095,7 @@ fn parse_merge_update_assignments(
                 .0
                 .last()
                 .and_then(|p| p.as_ident())
-                .map(|ident| ident.value.clone())
+                .map(normalize_sql_identifier)
                 .ok_or_else(|| {
                     QueryError::Other(
                         "MERGE UPDATE SET target column name is not a plain identifier".into(),
@@ -1132,6 +1145,27 @@ fn extract_source_alias(source: &TableFactor) -> Option<String> {
 /// Quote an identifier for use in a SQL string.
 fn quote_sql_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// RAII guard that deregisters a temporary DataFusion table on drop.
+///
+/// Used for MERGE's transient `__icefall_merge_src` registration so the table
+/// is cleaned up even if the join/evaluate query fails.
+struct DeregisterTableOnDrop<'a> {
+    ctx: &'a SessionContext,
+    name: &'a str,
+}
+
+impl<'a> DeregisterTableOnDrop<'a> {
+    fn new(ctx: &'a SessionContext, name: &'a str) -> Self {
+        Self { ctx, name }
+    }
+}
+
+impl Drop for DeregisterTableOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = self.ctx.deregister_table(self.name);
+    }
 }
 
 /// Build the post-image RecordBatch for a MERGE ... UPDATE SET with explicit
@@ -1218,11 +1252,13 @@ async fn build_matched_batch_with_assignments(
 
     // Register the matched source rows under an internal name; the SQL alias
     // used in the query is the original source alias so assignment RHS refs
-    // resolve correctly.
+    // resolve correctly.  The guard ensures the temp table is deregistered on
+    // every exit path, including errors from the join/evaluate query.
     let internal_src_name = "__icefall_merge_src";
     let _ = ctx.deregister_table(internal_src_name);
     ctx.register_batch(internal_src_name, src_batch)
         .map_err(|e| QueryError::Other(format!("MERGE: register source batch: {e}")))?;
+    let _src_guard = DeregisterTableOnDrop::new(ctx, internal_src_name);
 
     let table_q = quote_sql_identifier(table);
     let src_q = quote_sql_identifier(source_alias);
@@ -1269,8 +1305,6 @@ async fn build_matched_batch_with_assignments(
         .collect()
         .await
         .map_err(|e| QueryError::Other(format!("MERGE assignment evaluation error: {e}")))?;
-
-    let _ = ctx.deregister_table(internal_src_name);
 
     if batches.is_empty() {
         return Err(QueryError::Other(
@@ -1830,21 +1864,22 @@ async fn execute_update_to_delta(
             AssignmentTarget::ColumnName(obj_name) => {
                 // An ObjectName is a sequence of ObjectNamePart; take the last
                 // part (the column name itself, ignoring any schema/table prefix)
-                // and extract its Ident value.
-                obj_name
-                    .0
-                    .last()
-                    .ok_or_else(|| {
-                        QueryError::Other("UPDATE SET target column name is empty".into())
-                    })?
-                    .as_ident()
-                    .ok_or_else(|| {
-                        QueryError::Other(
-                            "UPDATE SET target column name is not a plain identifier".into(),
-                        )
-                    })?
-                    .value
-                    .clone()
+                // and extract its Ident value, normalizing unquoted identifiers
+                // to lowercase to match DataFusion's identifier resolution.
+                normalize_sql_identifier(
+                    obj_name
+                        .0
+                        .last()
+                        .ok_or_else(|| {
+                            QueryError::Other("UPDATE SET target column name is empty".into())
+                        })?
+                        .as_ident()
+                        .ok_or_else(|| {
+                            QueryError::Other(
+                                "UPDATE SET target column name is not a plain identifier".into(),
+                            )
+                        })?,
+                )
             }
             AssignmentTarget::Tuple(_) => {
                 return Err(QueryError::Other(
@@ -4339,6 +4374,91 @@ mod tests {
             scalar_i64(&ctx, "SELECT COUNT(*) FROM t_merge_bad_col").await,
             count_before,
             "table row count must be unchanged after failed MERGE"
+        );
+    }
+
+    /// UPDATE with an unquoted uppercase SET target must resolve to the lowercase
+    /// column name, matching DataFusion's identifier normalization.
+    #[tokio::test]
+    async fn update_unquoted_uppercase_set_target_resolves() {
+        let (ctx, storage, root, _tmp) = registered_table_two_cols("t_upd_upper", 10).await;
+
+        let affected = execute_sql(
+            &ctx,
+            Arc::clone(&storage),
+            &root,
+            "UPDATE t_upd_upper SET V = 999 WHERE id = 5",
+        )
+        .await
+        .expect("UPDATE with unquoted uppercase target must succeed");
+        assert_eq!(affected, 1, "one row should be updated");
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT v FROM t_upd_upper WHERE id = 5").await,
+            999,
+            "unquoted uppercase SET target must update the lowercase column"
+        );
+    }
+
+    /// MERGE with an unquoted uppercase UPDATE SET target must resolve to the
+    /// lowercase column name.
+    #[tokio::test]
+    async fn merge_unquoted_uppercase_update_target_resolves() {
+        let (ctx, storage, root, _tmp) = registered_table_unique("t_merge_upper", 5).await;
+
+        let merge_sql = "MERGE INTO t_merge_upper USING (VALUES (0, 999)) AS src(id, v) \
+             ON t_merge_upper.id = src.id \
+             WHEN MATCHED THEN UPDATE SET V = src.v \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (src.id, src.v)";
+
+        let affected = execute_sql(&ctx, Arc::clone(&storage), &root, merge_sql)
+            .await
+            .expect("MERGE with unquoted uppercase target must succeed");
+        assert_eq!(affected, 1, "one matched row should be updated");
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT v FROM t_merge_upper WHERE id = 0").await,
+            999,
+            "unquoted uppercase MERGE UPDATE target must update the lowercase column"
+        );
+    }
+
+    /// MERGE UPDATE SET temp-table registration must be cleaned up if the join
+    /// query fails, leaving the session in a state where a retry can re-register
+    /// the same internal name.
+    #[tokio::test]
+    async fn merge_temp_table_cleaned_up_on_assignment_error() {
+        let (ctx, storage, root, _tmp) = registered_table_three_cols("t_merge_cleanup", 5).await;
+
+        // Reference an unknown source column in the UPDATE SET RHS. This causes
+        // ctx.sql to fail after the temp table has been registered.
+        let merge_sql = "MERGE INTO t_merge_cleanup USING (VALUES (0, 1)) AS src(id, v) \
+             ON t_merge_cleanup.id = src.id \
+             WHEN MATCHED THEN UPDATE SET v = src.no_such_column \
+             WHEN NOT MATCHED THEN INSERT (id, v, w) VALUES (src.id, src.v, 0)";
+
+        let err = execute_sql(&ctx, Arc::clone(&storage), &root, merge_sql)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no_such_column") || msg.contains("column") || msg.contains("field"),
+            "expected column-not-found error, got: {msg}"
+        );
+
+        // A second attempt with the same internal temp-table name must be able
+        // to register it again, proving the first registration was cleaned up.
+        let merge_sql2 = "MERGE INTO t_merge_cleanup USING (VALUES (0, 999)) AS src(id, v) \
+             ON t_merge_cleanup.id = src.id \
+             WHEN MATCHED THEN UPDATE SET v = src.v \
+             WHEN NOT MATCHED THEN INSERT (id, v, w) VALUES (src.id, src.v, 0)";
+
+        let affected = execute_sql(&ctx, Arc::clone(&storage), &root, merge_sql2)
+            .await
+            .expect("retry after failed MERGE must succeed");
+        assert_eq!(affected, 1, "one matched row should be updated on retry");
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT v FROM t_merge_cleanup WHERE id = 0").await,
+            999,
+            "retry must apply the update"
         );
     }
 
