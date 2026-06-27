@@ -1081,11 +1081,24 @@ impl IndexMaintainer {
 
             // For unique indexes, verify the new values do not collide with
             // existing live keys (other than the row being updated itself).
+            // If the index has no loadable base (no generation and no legacy
+            // `_indexes/<name>.json` file) we cannot verify the invariant, so
+            // fail closed instead of silently writing an unchecked delta — a
+            // unique index without a base is itself an inconsistent state
+            // (normal create-index → insert → update always establishes one).
             if definition.unique && !adds.is_empty() {
-                if let Some(existing) =
-                    load_index_by_ref(storage.as_ref(), table, name, &current_ref).await?
-                {
-                    check_unique_adds(&definition, &existing, &adds, row_ids)?;
+                match load_index_by_ref(storage.as_ref(), table, name, &current_ref).await? {
+                    Some(existing) => check_unique_adds(&definition, &existing, &adds, row_ids)?,
+                    None => {
+                        return Err(IcefallDBError::Other(
+                            format!(
+                                "unique index '{name}' has no built base; cannot verify UPDATE \
+                                 uniqueness — rebuild the index before updating column '{}'",
+                                entry.column
+                            )
+                            .into(),
+                        ));
+                    }
                 }
             }
 
@@ -1187,12 +1200,24 @@ impl IndexMaintainer {
                     .await?;
 
             // For unique indexes, verify the new keys do not collide with existing
-            // live keys and are unique within the incoming batch.
+            // live keys and are unique within the incoming batch. Fail closed if
+            // the base cannot be loaded (it should exist after the establish-base
+            // fallback above; a missing/corrupt base file must not silently skip
+            // the uniqueness check).
             if definition.unique && !adds.is_empty() {
-                if let Some(existing) =
-                    load_index_by_ref(storage.as_ref(), table, name, &current_ref).await?
-                {
-                    check_unique_adds(&definition, &existing, &adds, &[])?;
+                match load_index_by_ref(storage.as_ref(), table, name, &current_ref).await? {
+                    Some(existing) => check_unique_adds(&definition, &existing, &adds, &[])?,
+                    None => {
+                        return Err(IcefallDBError::Other(
+                            format!(
+                                "unique index '{name}' base could not be loaded; cannot verify \
+                                 INSERT uniqueness — rebuild the index before inserting into \
+                                 column '{}'",
+                                entry.column
+                            )
+                            .into(),
+                        ));
+                    }
                 }
             }
 

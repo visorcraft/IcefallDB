@@ -35,6 +35,7 @@ use datafusion::common::DataFusionError;
 use datafusion_execution::parquet_encryption::EncryptionFactory;
 use icefalldb_core::encryption::{
     build_decryption_properties, table_aad_prefix, EncryptionKeySet, KeyIdentifier, KeyProvider,
+    Zeroizing,
 };
 use object_store::path::Path as ObjectStorePath;
 
@@ -256,7 +257,7 @@ impl EncryptionKeyResolver {
         // not-found error (not the key bytes), so a real all-zero footer key
         // still verifies its signature. No secret material is involved here.
         let footer_bytes = match self.provider.get(&self.footer_key_id, &self.aad).await {
-            Ok(footer) => footer.as_slice().to_vec(),
+            Ok(footer) => Zeroizing::new(footer.as_slice().to_vec()),
             Err(e) => {
                 let is_key_not_found =
                     matches!(e, icefalldb_core::IcefallDBError::EncryptionKeyNotFound(_));
@@ -278,8 +279,11 @@ impl EncryptionKeyResolver {
             }
         };
 
-        // Resolve only the per-column keys actually needed by this query.
-        let mut column_keys: std::collections::BTreeMap<String, Vec<u8>> =
+        // Resolve only the per-column keys actually needed by this query. Keys
+        // are held in `Zeroizing` buffers from the moment they are copied out of
+        // the provider so the material stays wiped on drop (including across a
+        // panic between resolution and key-set construction).
+        let mut column_keys: std::collections::BTreeMap<String, Zeroizing<Vec<u8>>> =
             std::collections::BTreeMap::new();
         for name in needed_columns {
             if let Some(kid) = self.column_key_ids.get(name) {
@@ -288,15 +292,16 @@ impl EncryptionKeyResolver {
                     .get(kid, &self.aad)
                     .await
                     .map_err(map_enc_err)?;
-                column_keys.insert(name.clone(), key.as_slice().to_vec());
+                column_keys.insert(name.clone(), Zeroizing::new(key.as_slice().to_vec()));
             }
         }
 
         // Build through `EncryptionKeySet` so all key material is held in
         // `Zeroizing` buffers (wiped on drop) and the shared builder is reused,
         // restoring the project-wide invariant the bespoke builder bypassed.
-        let key_set = EncryptionKeySet::with_columns(footer_bytes, column_keys, self.aad.clone())
-            .map_err(map_enc_err)?;
+        let key_set =
+            EncryptionKeySet::with_columns_zeroizing(footer_bytes, column_keys, self.aad.clone())
+                .map_err(map_enc_err)?;
         build_decryption_properties(&key_set).map_err(map_enc_err)
     }
 }

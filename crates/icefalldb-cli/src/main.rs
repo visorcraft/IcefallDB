@@ -1440,6 +1440,18 @@ async fn run_create_index(
         .await
         .with_context(|| "acquiring catalog lock")?;
 
+    // Acquire the per-table exclusive write lock and hold it across index
+    // build + catalog save so a concurrent insert/commit cannot land between
+    // the build snapshot and the catalog publication. Without this, the
+    // freshly-built index would miss the racing writer's rows and a subsequent
+    // unique-index probe would not see them, silently breaking the uniqueness
+    // invariant (M01 TOCTOU).
+    let write_lock_path = format!("{table}/_write.lock");
+    let _write_lock = storage
+        .lock_exclusive(&write_lock_path, Duration::from_secs(30))
+        .await
+        .with_context(|| "acquiring table write lock")?;
+
     // Validate that the column exists in the table's latest schema.
     let schema = load_table_schema(storage.as_ref(), table)
         .await

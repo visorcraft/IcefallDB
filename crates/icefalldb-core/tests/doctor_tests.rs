@@ -911,3 +911,85 @@ async fn test_doctor_flags_missing_data_file() {
         .iter()
         .any(|i| i.kind == DiagnosisKind::IntegrityError));
 }
+
+/// Regression (M08 follow-up): a pre-checksum (legacy) manifest — empty
+/// `checksum` and absent `committed_at` — must still protect the row-group
+/// files it references during `doctor repair`. `validate_snapshots` previously
+/// lacked the legacy-anchor carve-out that `retained_valid_manifests` (used by
+/// `check`) and `verify_history` already had, so `doctor repair` deleted those
+/// files as orphans while `check` considered them referenced — silent data loss
+/// for tables upgraded across the hash-chain feature boundary.
+#[tokio::test]
+async fn test_doctor_preserves_files_referenced_by_legacy_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = LocalStorage::new(tmp.path()).unwrap();
+    let table = "products";
+
+    let schema = make_schema();
+    let mut writer = Writer::new(Arc::new(storage.clone()), table, schema)
+        .await
+        .unwrap();
+    writer
+        .insert_batch(make_batch(vec![1, 2, 3]))
+        .await
+        .unwrap();
+    writer.commit().await.unwrap();
+
+    // Second commit with distinct rows → distinct data/meta files only the
+    // sequence-1 snapshot references.
+    let mut writer = Writer::new(Arc::new(storage.clone()), table, make_schema())
+        .await
+        .unwrap();
+    writer
+        .insert_batch(make_batch(vec![4, 5, 6]))
+        .await
+        .unwrap();
+    writer.commit().await.unwrap();
+
+    // Capture the sequence-1 row-group files (referenced only by snapshot 1).
+    let manifest_v1: Manifest = serde_json::from_slice(
+        &storage
+            .read(&format!("{}/{}", table, Manifest::filename(1)))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let legacy_files: Vec<String> = manifest_v1
+        .row_groups
+        .iter()
+        .flat_map(|rg| [rg.data.clone(), rg.meta.clone()])
+        .collect();
+    assert!(!legacy_files.is_empty());
+
+    // Convert the sequence-1 manifest into a legacy anchor: blank the checksum
+    // and drop the timestamp, exactly matching a pre-hash-chain manifest.
+    let mut legacy = manifest_v1.clone();
+    legacy.checksum = String::new();
+    legacy.committed_at = None;
+    let serialized = serde_json::to_vec_pretty(&legacy).unwrap();
+    storage
+        .write(&format!("{}/{}", table, Manifest::filename(1)), &serialized)
+        .await
+        .unwrap();
+
+    // `check` must still consider these files referenced (legacy carve-out).
+    // `doctor repair` must not delete them either.
+    let doctor = Doctor::new(&storage, table);
+    let result = doctor.repair().await.unwrap();
+
+    for f in &legacy_files {
+        assert!(
+            storage.exists(&format!("{table}/{f}")).await.unwrap(),
+            "doctor repair deleted legacy-referenced file {f}"
+        );
+    }
+    // No deletion action should target the legacy files.
+    let deleted_legacy = result
+        .actions
+        .iter()
+        .any(|a| a.kind == ActionKind::Deleted && legacy_files.contains(&a.path));
+    assert!(
+        !deleted_legacy,
+        "doctor repair must not report legacy-referenced files as deleted: {result:?}"
+    );
+}

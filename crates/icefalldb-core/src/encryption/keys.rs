@@ -132,6 +132,17 @@ impl EncryptionKeySet {
         })
     }
 
+    /// Like [`footer_only`](Self::footer_only) but consumes a [`Zeroizing`] footer
+    /// buffer so the bytes never live in a plain `Vec<u8>`.
+    pub fn footer_only_zeroizing(footer: Zeroizing<Vec<u8>>, aad_prefix: Vec<u8>) -> Result<Self> {
+        validate_key(&footer)?;
+        Ok(Self {
+            footer,
+            columns: BTreeMap::new(),
+            aad_prefix,
+        })
+    }
+
     /// Build a key set with per-column keys. All keys must have the same length.
     pub fn with_columns(
         footer: Vec<u8>,
@@ -145,7 +156,7 @@ impl EncryptionKeySet {
             if len != footer_len {
                 return Err(IcefallDBError::Encryption(format!(
                     "column '{name}' key length {:?} does not match footer key length {:?}; \
-                     Parquet modular encryption requires consistent key lengths per file",
+                     Parquet modular encryption requires consistent key lengths per table",
                     len, footer_len
                 )));
             }
@@ -153,6 +164,36 @@ impl EncryptionKeySet {
         }
         Ok(Self {
             footer: Zeroizing::new(footer),
+            columns: cols,
+            aad_prefix,
+        })
+    }
+
+    /// Like [`with_columns`](Self::with_columns) but consumes key material that
+    /// the caller already holds in [`Zeroizing`] buffers, so the bytes stay
+    /// zeroized for their entire lifetime (including across a panic between key
+    /// resolution and key-set construction) instead of transiently living in a
+    /// plain `Vec<u8>`.
+    pub fn with_columns_zeroizing(
+        footer: Zeroizing<Vec<u8>>,
+        columns: BTreeMap<String, Zeroizing<Vec<u8>>>,
+        aad_prefix: Vec<u8>,
+    ) -> Result<Self> {
+        let footer_len = validate_key(&footer)?;
+        let mut cols: BTreeMap<String, Zeroizing<Vec<u8>>> = BTreeMap::new();
+        for (name, key) in columns {
+            let len = validate_key(&key)?;
+            if len != footer_len {
+                return Err(IcefallDBError::Encryption(format!(
+                    "column '{name}' key length {:?} does not match footer key length {:?}; \
+                     Parquet modular encryption requires consistent key lengths per table",
+                    len, footer_len
+                )));
+            }
+            cols.insert(name, key);
+        }
+        Ok(Self {
+            footer,
             columns: cols,
             aad_prefix,
         })

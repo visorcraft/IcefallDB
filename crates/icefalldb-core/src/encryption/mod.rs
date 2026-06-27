@@ -41,3 +41,8 @@ pub use properties::{build_decryption_properties, build_encryption_properties};
 pub use provider::{
     EnvKeyProvider, FileKeyProvider, KeyProvider, StaticKeyProvider, KEY_ID_ENV_PREFIX,
 };
+/// Re-export so downstream crates (e.g. `icefalldb-query`) can hold key material
+/// in `Zeroizing` buffers without taking a direct `zeroize` dependency and
+/// risking a version skew.
+#[cfg(feature = "encryption")]
+pub use zeroize::Zeroizing;

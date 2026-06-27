@@ -16,7 +16,7 @@ use {
     crate::encryption::provider::KeyProvider,
     crate::encryption::{
         build_decryption_properties, table_aad_prefix, EncryptionKeySet, KeyIdentifier,
-        SchemaEncryptionMarker,
+        SchemaEncryptionMarker, Zeroizing,
     },
     base64::Engine,
     std::sync::Arc,
@@ -315,20 +315,23 @@ impl<'a> Checker<'a> {
             Err(e) => return Err(e),
         };
 
-        let mut col_keys = std::collections::BTreeMap::new();
+        let mut col_keys: std::collections::BTreeMap<String, Zeroizing<Vec<u8>>> =
+            std::collections::BTreeMap::new();
         for (col, kid) in &marker.column_key_ids {
             let key = match provider.get(&KeyIdentifier::new(kid.clone()), &aad).await {
                 Ok(k) => k,
                 Err(crate::IcefallDBError::EncryptionKeyNotFound(_)) => return Ok(None),
                 Err(e) => return Err(e),
             };
-            col_keys.insert(col.clone(), key.as_slice().to_vec());
+            col_keys.insert(col.clone(), key);
         }
 
+        // Keys are consumed as `Zeroizing` buffers (the provider already returns
+        // them that way) so no secret material is ever held in a plain `Vec`.
         let keyset = if col_keys.is_empty() {
-            EncryptionKeySet::footer_only(footer_key.as_slice().to_vec(), aad)?
+            EncryptionKeySet::footer_only_zeroizing(footer_key, aad)?
         } else {
-            EncryptionKeySet::with_columns(footer_key.as_slice().to_vec(), col_keys, aad)?
+            EncryptionKeySet::with_columns_zeroizing(footer_key, col_keys, aad)?
         };
 
         Ok(Some(build_decryption_properties(&keyset)?))

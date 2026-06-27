@@ -35,6 +35,18 @@ fn run_cli(args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// Return the latest snapshot *data* line (leading token parses as a u64
+/// sequence number), skipping the header and the WAL-fold note line.
+fn latest_snapshot_data_line(out: &str) -> &str {
+    out.lines()
+        .find(|l| {
+            l.split_whitespace()
+                .next()
+                .is_some_and(|t| t.parse::<u64>().is_ok())
+        })
+        .expect("expected a snapshot data line")
+}
+
 fn make_schema() -> Schema {
     Schema {
         schema_id: 1,
@@ -247,5 +259,72 @@ async fn snapshots_live_rows_after_wal_fold() {
     assert!(
         latest_line.contains(" 2 "),
         "latest snapshot should show 2 live rows after WAL fold, got:\n{out}"
+    );
+}
+
+/// UPDATE goes through the WAL fast-commit path and writes a patch fragment
+/// (delete the original row + add a replacement row). The folded live-row count
+/// must account for that patch fragment (matching `SELECT COUNT(*)`), not
+/// undercount it. Regression test for the M07 patch-fragment folding path that
+/// the DELETE-only tests did not cover — the count stays at 3 because UPDATE
+/// deletes-then-inserts one row, but a buggy fold that ignored the patch
+/// fragment's addition would report 2.
+#[tokio::test]
+async fn snapshots_live_rows_after_update() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path();
+    let storage = LocalStorage::new(db).unwrap();
+
+    let mut writer = Writer::new(Arc::new(storage.clone()), "bench", make_schema())
+        .await
+        .unwrap();
+    writer
+        .insert_batch(make_batch(vec![1, 2, 3]))
+        .await
+        .unwrap();
+    writer.commit().await.unwrap();
+
+    let db_str = db.to_str().unwrap().to_string();
+    let table_arg = format!("{}/bench", db_str);
+
+    // UPDATE writes a patch fragment via WAL fast-commit; row count stays 3
+    // (one row deleted from the original fragment, one added in the patch).
+    run_cli(&["query", &table_arg, "UPDATE bench SET id = 10 WHERE id = 1"]);
+
+    // Live query count must be 3 (UPDATE does not change the row count).
+    let query_out = run_cli(&["query", &table_arg, "SELECT COUNT(*) FROM bench"]);
+    assert!(
+        query_out.contains("3"),
+        "live query should return 3, got:\n{query_out}"
+    );
+
+    // Helper: return the latest snapshot *data* line (leading token is a u64
+    // sequence number), skipping the header and the WAL-fold note line.
+    // `snapshots` must show 3 for the latest (WAL-folded) snapshot. A fold that
+    // ignored the patch fragment's added row would report 2.
+    let out = run_cli(&["snapshots", &db_str, "bench"]);
+    let latest_line = latest_snapshot_data_line(&out);
+    let rows = latest_line
+        .split_whitespace()
+        .nth(2)
+        .expect("rows column present");
+    assert_eq!(
+        rows, "3",
+        "latest snapshot should show 3 live rows after UPDATE, got:\n{out}"
+    );
+
+    // Fold the WAL into a fresh checkpoint (republishes manifest with
+    // `row_counts: None`) and re-check: the count must still be 3, proving the
+    // `.meta`-based fallback counts the patch fragment's rows too.
+    run_cli(&["gc", &db_str, "bench"]);
+    let out = run_cli(&["snapshots", &db_str, "bench"]);
+    let latest_line = latest_snapshot_data_line(&out);
+    let rows = latest_line
+        .split_whitespace()
+        .nth(2)
+        .expect("rows column present");
+    assert_eq!(
+        rows, "3",
+        "latest snapshot should show 3 live rows after WAL fold, got:\n{out}"
     );
 }

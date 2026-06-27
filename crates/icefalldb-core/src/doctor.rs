@@ -849,8 +849,16 @@ impl<'a> Doctor<'a> {
                 });
                 continue;
             }
+            // Legacy anchor rule (mirrors `verify_history`): a pre-checksum
+            // manifest has an empty `checksum` AND no `committed_at`. Treat it
+            // as valid so its referenced row-group files stay protected during
+            // `delete_orphans` — otherwise `doctor repair` deletes files that
+            // `check` considers referenced, losing data. A blanked checksum
+            // with a timestamp present is post-chain tampering and must fall
+            // through to the mismatch branch below.
             match manifest.verify_checksum() {
                 Ok(true) => {}
+                Ok(false) if manifest.checksum.is_empty() && manifest.committed_at.is_none() => {}
                 Ok(false) => {
                     invalid.push(InvalidSnapshot {
                         path: rel_path,
@@ -1202,7 +1210,9 @@ pub async fn retained_valid_manifests(
         }
         match manifest.verify_checksum() {
             Ok(true) => {}
-            Ok(false) if manifest.checksum.is_empty() => {} // legacy: no checksum
+            Ok(false) if manifest.checksum.is_empty() && manifest.committed_at.is_none() => {
+                // legacy: no checksum and pre-chain (no timestamp)
+            }
             Ok(false) | Err(_) => continue,
         }
         valid.insert(seq, manifest);

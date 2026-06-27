@@ -1020,21 +1020,14 @@ pub struct SnapshotInfo {
     pub sequence: u64,
     pub committed_at: Option<String>,
     /// Live rows (physical rows minus `deleted_count`). For the current
-    /// checkpoint snapshot this folds any pending mutation WAL so it matches the
-    /// live query count; older snapshots reflect their committed deletion state.
-    ///
-    /// **WAL-folded caveat:** the folded live-row count is accurate when the
-    /// pending WAL records are DELETE-only. UPDATE/MERGE WAL records may append
-    /// new fragments that are not reflected in the checkpoint's physical row
-    /// count, causing the displayed count to undercount until the next checkpoint.
+    /// checkpoint snapshot this folds any pending mutation WAL (DELETE,
+    /// UPDATE, and MERGE) so it matches the live query count (`SELECT
+    /// COUNT(*)`); older snapshots reflect their committed deletion state.
     pub rows: u64,
     pub fragments: usize,
     pub parent_hash: Option<String>,
     /// `true` when the row count was computed by folding pending WAL records
-    /// into the current checkpoint snapshot.
-    ///
-    /// When `true`, [`SnapshotInfo::rows`] is DELETE-only exact; UPDATE/MERGE
-    /// WAL records may undercount live rows until the next checkpoint.
+    /// (DELETE/UPDATE/MERGE) into the current checkpoint snapshot.
     pub wal_folded: bool,
 }
 
@@ -1065,10 +1058,14 @@ pub async fn build_scan_plan_at(
         serde_json::from_slice(&bytes).map_err(|_| IcefallDBError::SnapshotNotFound(sequence))?;
 
     // Verify the historical manifest's integrity.  Legacy manifests have an
-    // empty checksum field; skip verification for those so time-travel reads on
-    // legacy tables remain functional.  A non-empty checksum that does not match
-    // indicates a corrupt or truncated manifest file.
-    if !manifest.checksum.is_empty() && !manifest.verify_checksum()? {
+    // empty checksum field AND no `committed_at` (both fields were introduced
+    // together with hash chaining); skip verification for those so time-travel
+    // reads on legacy tables remain functional.  A non-empty checksum that does
+    // not match indicates a corrupt or truncated manifest file.  An empty
+    // checksum with a timestamp present is post-chain tampering and must still
+    // be rejected.
+    let is_legacy_anchor = manifest.checksum.is_empty() && manifest.committed_at.is_none();
+    if !is_legacy_anchor && !manifest.verify_checksum()? {
         return Err(IcefallDBError::ChecksumMismatch { path });
     }
 

@@ -329,7 +329,7 @@ async fn create_index_handler(
     State(server): State<Server>,
     Json(req): Json<SqlRequest>,
 ) -> Result<Json<Value>, ServerError> {
-    let (index_name, table, column) = parse_create_index(&req.sql).ok_or_else(|| {
+    let (index_name, table, column, unique) = parse_create_index(&req.sql).ok_or_else(|| {
         ServerError::BadRequest("expected CREATE INDEX name ON table (column)".into())
     })?;
 
@@ -341,24 +341,39 @@ async fn create_index_handler(
                 .acquire_lock(Duration::from_secs(30))
                 .await
                 .map_err(ServerError::from)?;
-            catalog
-                .create_index_definition(&guard, &index_name, &table, &column, "btree")
-                .await?;
 
             let cat = Catalog::load(server.storage.as_ref(), &table).await?;
             let manifest = cat.latest_manifest().ok_or_else(|| {
                 ServerError::NotFound(format!("table {} has no committed manifest", table))
             })?;
+            // Build the index in memory first, carrying the `unique` flag so
+            // `build_btree_index` rejects any key with more than one live row.
+            // Doing this *before* the catalog definition is written means a
+            // uniqueness violation (or any build error) leaves the catalog
+            // unchanged — no dangling definition (matches the CLI ordering).
             let definition = IndexDefinition {
                 name: index_name.clone(),
                 table: table.clone(),
                 column: column.clone(),
-                unique: false,
+                unique,
             };
             let index = build_btree_index(server.storage.as_ref(), &definition, manifest).await?;
             index.save(server.storage.as_ref()).await?;
 
-            Ok::<_, ServerError>(json!({"status": "created", "index": index_name}))
+            catalog
+                .create_index_definition_with_options(
+                    &guard,
+                    &index_name,
+                    &table,
+                    &column,
+                    "btree",
+                    unique,
+                )
+                .await?;
+
+            Ok::<_, ServerError>(
+                json!({"status": "created", "index": index_name, "unique": unique}),
+            )
         })
     })
     .await
@@ -438,7 +453,7 @@ async fn rollback_handler(
     Ok(Json(json!({"status": "rolled back"})))
 }
 
-fn parse_create_index(sql: &str) -> Option<(String, String, String)> {
+fn parse_create_index(sql: &str) -> Option<(String, String, String, bool)> {
     let statements = DFParser::parse_sql(sql).ok()?;
     let statement = statements.into_iter().next()?;
     let datafusion::sql::parser::Statement::Statement(stmt) = statement else {
@@ -448,8 +463,9 @@ fn parse_create_index(sql: &str) -> Option<(String, String, String)> {
         return None;
     };
 
+    let unique = create_index.unique;
     let index_name = create_index.name.as_ref()?.to_string();
     let table = create_index.table_name.to_string();
     let column = create_index.columns.first()?.column.expr.to_string();
-    Some((index_name, table, column))
+    Some((index_name, table, column, unique))
 }

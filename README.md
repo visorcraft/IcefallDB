@@ -107,7 +107,9 @@ is flat in table size, not proportional to it.
   rather than scanning the fragment.
 - **Secondary indexes** (`create-index [--unique]`): canonical JSON B-tree plus a
   mmap'd binary `.idx` for O(1) open and a tiny learned `.model` for affine
-  integer keys (constant-size, arithmetic locate); derived and optional.
+  integer keys (constant-size, arithmetic locate); derived and optional. A
+  `--unique` index actively enforces uniqueness — creation rejects duplicate live
+  keys and INSERT/UPDATE/MERGE reject key collisions under the write lock.
 - **Warm-aggregate cache:** `.agg` partials, partial-aggregate pushdown for
   range filters, cross-query reuse, optional approximate `approx_distinct` /
   `approx_percentile_cont` (the `sketches` feature).
@@ -210,6 +212,7 @@ icefalldb import        <db> <table> <file.tsv>
 icefalldb export        <db> <table> <file.tsv>
 icefalldb create-index  <db> <table> <column> [--unique] [--index-type btree]
 icefalldb query         <table-dir | db> "<SQL>" [-t <extra-table>...] [--format json|csv]
+icefalldb snapshots     <db> <table>
 icefalldb check         <db> <table>
 icefalldb doctor        <db> <table> [--repair]
 icefalldb compact       <db> <table>

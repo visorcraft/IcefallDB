@@ -618,6 +618,21 @@ pub async fn plan_update(
     let rows =
         arrow::compute::concat_batches(&data_schema, &row_batches).map_err(QueryError::Arrow)?;
 
+    // Enforce non-nullable columns at runtime: a SET expression that is not a
+    // bare NULL literal (e.g. `SET non_null = CASE ... END`, or a nullable
+    // source column) can still evaluate to NULL on the matched rows. Reject it
+    // before the writer sees the batch — `Writer::commit_update` only compares
+    // names/types and the Parquet encoder accepts a validity buffer on a
+    // non-nullable field, so without this check the schema invariant would be
+    // silently corrupted. (See M02 follow-up.)
+    let target_data_fields = full_schema
+        .fields()
+        .iter()
+        .take(n_data)
+        .cloned()
+        .collect::<Vec<_>>();
+    enforce_non_nullable_post_image(table, &target_data_fields, &rows)?;
+
     Ok(UpdateBatch { rows, locs })
 }
 
@@ -1127,7 +1142,40 @@ fn coerce_update_null_literals(
     Ok(())
 }
 
-/// Parse and validate the assignments in a `WHEN MATCHED THEN UPDATE SET`
+/// Enforce that a post-image batch does not write NULLs into a non-nullable
+/// target column.
+///
+/// `coerce_update_null_literals` and the MERGE `DataType::Null` cast only catch
+/// a *bare* `NULL` literal. A non-literal expression that *evaluates* to null
+/// at runtime — e.g. `SET non_null_col = CASE WHEN ... THEN NULL ELSE 0 END`
+/// or `SET non_null_col = other_nullable_col` — is typed by DataFusion as the
+/// concrete type with a validity bitmap and would otherwise slip through,
+/// silently corrupting the schema invariant (Parquet encoding of a non-nullable
+/// field accepts a validity buffer, and `Writer::commit_update` compares names
+/// and types only). This check walks the non-nullable target data fields and
+/// rejects any column whose post-image array has a non-zero null count.
+fn enforce_non_nullable_post_image(
+    table_name: &str,
+    target_data_fields: &[arrow::datatypes::FieldRef],
+    rows: &RecordBatch,
+) -> Result<()> {
+    for (i, field) in target_data_fields.iter().enumerate() {
+        if !field.is_nullable() {
+            let nulls = rows.column(i).null_count();
+            if nulls > 0 {
+                return Err(QueryError::Core(IcefallDBError::SchemaMismatch {
+                    column: field.name().to_string(),
+                    expected: format!(
+                        "non-nullable column received {nulls} NULL value(s) from SET expression"
+                    ),
+                    path: table_name.to_string(),
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// clause.
 ///
 /// Returns a vector of `(target_column, rhs_sql_string)` pairs.  The RHS string
@@ -1398,7 +1446,13 @@ async fn build_matched_batch_with_assignments(
             }
         })
         .collect::<Result<Vec<_>>>()?;
-    RecordBatch::try_new(target_data_schema, data_arrays).map_err(QueryError::Arrow)
+    let out = RecordBatch::try_new(target_data_schema, data_arrays).map_err(QueryError::Arrow)?;
+    // Enforce non-nullable columns at runtime for the same reason `plan_update`
+    // does: a non-bare-NULL expression (e.g. `SET non_null = CASE ... END` or a
+    // nullable source column) evaluates to a typed-but-nullable array that the
+    // cast branch above does not inspect. (M02 follow-up.)
+    enforce_non_nullable_post_image(table, &target_data_fields, &out)?;
+    Ok(out)
 }
 
 /// Parse and execute a SQL statement against a IcefallDB table.
@@ -2423,13 +2477,16 @@ fn extract_merge_key(on: &SqlExpr, target_table: &str) -> crate::Result<String> 
             // Helper: if `expr` is a CompoundIdentifier whose qualifier matches
             // the target table, return the column name.  Plain identifiers are
             // not accepted here — they are ambiguous (either side could be the
-            // target or the source).
+            // target or the source).  The column name is normalized (unquoted →
+            // lowercase, quoted preserved) so an ON clause like `t.Id = src.Id`
+            // resolves to the declared `id` column instead of the case-sensitive
+            // quoted `"Id"` failing the JOIN.
             let try_extract_compound = |expr: &SqlExpr| -> Option<String> {
                 match expr {
                     SqlExpr::CompoundIdentifier(parts) if parts.len() == 2 => {
                         let qualifier = parts[0].value.to_lowercase();
                         if qualifier == target_lower {
-                            Some(parts[1].value.clone())
+                            Some(normalize_sql_identifier(&parts[1]))
                         } else {
                             None
                         }
@@ -3856,6 +3913,75 @@ mod tests {
             scalar_i64(&ctx, "SELECT COUNT(*) FROM t_non_null_upd").await,
             10,
             "rejected UPDATE must not change the row count"
+        );
+    }
+
+    /// Regression (M02 follow-up): a SET expression that is *not* a bare NULL
+    /// literal but evaluates to NULL on the matched rows must also be rejected
+    /// for a non-nullable target. `coerce_update_null_literals` only rewrites
+    /// bare `Expr::Literal(Null)`; a CASE/nullable-column expression is typed by
+    /// DataFusion as the concrete type with a validity bitmap and would slip
+    /// through, silently corrupting the schema invariant. The post-image
+    /// nullability check (`enforce_non_nullable_post_image`) must catch it.
+    #[tokio::test]
+    async fn update_non_nullable_via_null_expression_fails() {
+        let (ctx, storage, root, _tmp) = registered_table_two_cols("t_non_null_expr", 10).await;
+
+        // CASE WHEN id > 3 THEN NULL ELSE v END produces a typed Int64 array
+        // with nulls on rows 4..10; v is non-nullable.
+        let err = execute_sql(
+            &ctx,
+            Arc::clone(&storage),
+            &root,
+            "UPDATE t_non_null_expr SET v = CASE WHEN id > 3 THEN NULL ELSE v END",
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("non-nullable"),
+            "expected non-nullable column error from null-yielding expression, got: {msg}"
+        );
+
+        // Table must be unchanged.
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT COUNT(*) FROM t_non_null_expr").await,
+            10,
+            "rejected UPDATE must not change the row count"
+        );
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT v FROM t_non_null_expr WHERE id = 5").await,
+            50,
+            "rejected UPDATE must leave rows untouched"
+        );
+    }
+
+    /// Regression (M04 follow-up): an unquoted mixed-case ON key column must
+    /// resolve to the declared lowercase column. `extract_merge_key` used to
+    /// return the raw identifier; quoting it then failed the join against the
+    /// real `id` column.
+    #[tokio::test]
+    async fn merge_unquoted_uppercase_on_key_resolves() {
+        let (ctx, storage, root, _tmp) = registered_table_unique("t_merge_case", 5).await;
+
+        // ON t.Id = src.Id — unquoted, must normalize to `id`.
+        let n = execute_sql(
+            &ctx,
+            Arc::clone(&storage),
+            &root,
+            "MERGE INTO t_merge_case USING (VALUES (1, 999)) AS src(id, v) \
+             ON t_merge_case.Id = src.Id \
+             WHEN MATCHED THEN UPDATE SET v = src.v \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (src.id, src.v)",
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "MERGE should match the one row with id=1");
+
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT v FROM t_merge_case WHERE id = 1").await,
+            999,
+            "MERGE with unquoted mixed-case ON key must update the matched row"
         );
     }
 
