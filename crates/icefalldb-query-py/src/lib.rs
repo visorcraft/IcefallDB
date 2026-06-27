@@ -289,14 +289,14 @@ fn replace_registered_table(
 }
 
 /// Open providers for `tables` and register them in `ctx`, replacing any prior
-/// registrations. Returns `true` when at least one table is encrypted.
+/// registrations.
 async fn register_all_providers(
     ctx: &SessionContext,
     storage: &Arc<dyn Storage>,
     tables: &[String],
     snapshot: Option<u64>,
     _key_file: Option<&str>,
-) -> PyResult<bool> {
+) -> PyResult<()> {
     let config = ProviderConfig::default();
 
     #[cfg(feature = "encryption")]
@@ -332,7 +332,7 @@ async fn register_all_providers(
                 };
                 replace_registered_table(ctx, table, provider)?;
             }
-            return Ok(true);
+            return Ok(());
         }
     }
 
@@ -344,7 +344,7 @@ async fn register_all_providers(
         };
         replace_registered_table(ctx, table, provider)?;
     }
-    Ok(false)
+    Ok(())
 }
 
 #[pymethods]
@@ -577,7 +577,6 @@ impl IcefallDBConnection {
                 let guard = ctx.lock().await;
                 register_all_providers(&guard, &storage, &tables, snapshot, key_file.as_deref())
                     .await
-                    .map(|_| ())
             })
         })
     }
