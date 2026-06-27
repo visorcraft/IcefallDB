@@ -352,3 +352,47 @@ async fn test_create_unique_index_rejects_duplicates_and_leaves_catalog_clean() 
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "created");
 }
+
+#[tokio::test]
+async fn test_sql_unknown_table_is_client_error_not_500() {
+    // A query naming a table that does not exist is a *client* error (bad SQL),
+    // not a server fault: it must map to 4xx, never 500. Regression guard for the
+    // daemon surfacing DataFusion planning errors as HTTP 500.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().to_path_buf();
+
+    let storage = Arc::new(LocalStorage::new(&db).unwrap());
+    let schema = Schema {
+        schema_id: 1,
+        columns: vec![Column::new("id", "int64", false)],
+        partition_by: None,
+        sort: None,
+        agg_group_keys: None,
+        row_group_target_rows: 1000,
+        row_group_target_bytes: 1024,
+        dropped_columns: vec![],
+        max_field_id: 0,
+    };
+    Writer::create(storage, "real", schema).await.unwrap();
+
+    let server = Server::new(&db).await.unwrap();
+    let (url, _handle) = server.start_for_test().await.unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/sql", url))
+        .json(&serde_json::json!({"sql": "SELECT COUNT(*) FROM does_not_exist"}))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert!(
+        status.is_client_error(),
+        "unknown-table query must be a 4xx client error, got {status}: {body}"
+    );
+    assert!(
+        body.to_lowercase().contains("not found") || body.contains("does_not_exist"),
+        "error body should explain the missing table: {body}"
+    );
+}

@@ -131,9 +131,26 @@ def bench_daemon(
             )
             return None
         out: dict[str, tuple[float, float]] = {}
-        for name, sql, _tables in QUERIES:
-            cold = _timed(lambda s=sql: post(s))
-            warm = median([_timed(lambda s=sql: post(s)) for _ in range(warm_iters)])
+        registered_set = set(registered)
+        for name, sql, tables in QUERIES:
+            # The daemon serves only catalog-registered tables (the catalog is
+            # authoritative by design, so a directory-only table is invisible).
+            # Skip such queries with a clear N/A instead of aborting the whole
+            # daemon section on the first HTTP error.
+            if not set(tables).issubset(registered_set):
+                missing = sorted(set(tables) - registered_set)
+                print(f"  {name}: N/A (daemon has no catalog entry for {missing})")
+                out[name] = (float("nan"), float("nan"))
+                continue
+            try:
+                cold = _timed(lambda s=sql: post(s))
+                warm = median(
+                    [_timed(lambda s=sql: post(s)) for _ in range(warm_iters)]
+                )
+            except urllib.error.HTTPError as e:
+                print(f"  {name}: N/A (daemon HTTP {e.code})")
+                out[name] = (float("nan"), float("nan"))
+                continue
             out[name] = (cold, warm)
         return out
     finally:
@@ -145,7 +162,7 @@ def bench_daemon(
 
 
 def _fmt(x: float) -> str:
-    return f"{x:.2f}"
+    return "N/A" if x != x else f"{x:.2f}"  # x != x is True only for NaN
 
 
 def main() -> int:
