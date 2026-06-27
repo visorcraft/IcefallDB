@@ -69,7 +69,7 @@ fn make_provider(table: &str) -> Arc<dyn KeyProvider> {
         KeyIdentifier::new(format!("{table}-v1")),
         FOOTER_KEY.to_vec(),
     );
-    Arc::new(StaticKeyProvider::new(keys))
+    Arc::new(StaticKeyProvider::new(keys).unwrap())
 }
 
 #[tokio::test]

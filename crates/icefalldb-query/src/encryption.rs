@@ -45,23 +45,40 @@ use crate::Result;
 ///
 /// Exposed as `datafusion.common.extensions_options`-generated fields under
 /// the `icefalldb.encryption.*` namespace.
-#[derive(Debug, Default, Clone)]
-pub struct IcefallDBdbEncryptionConfig {
+#[derive(Debug, Clone)]
+pub struct IcefallDBEncryptionConfig {
     /// Key identifier for the footer key, e.g. `"events-v1"`. Resolved via
     /// the registered [`KeyProvider`].
     pub footer_key_id: String,
     /// Comma-separated `col=KeyId` pairs, e.g. `"ssn=ssn-v1,email=email-v1"`.
     /// Empty means footer-only encryption.
     pub column_key_ids: String,
-    /// Optional table-name hint used to disambiguate AAD when multiple
-    /// encrypted tables share a session.
+    /// Optional table-name hint used to derive the AAD prefix (with
+    /// [`Self::schema_id`]) via [`table_aad_prefix`]. When unset, no AAD is
+    /// supplied to the reader (see [`Self::derive_aad`]).
     pub table_hint: String,
-    /// Whether the Parquet footer is left unencrypted. Should match the
-    /// writer's setting. Defaults to `true` (the IcefallDB writer default).
-    pub plaintext_footer: bool,
+    /// Schema id folded into the derived AAD prefix when `table_hint` is set.
+    /// Defaults to `1` to match the writer's first schema revision.
+    pub schema_id: u64,
+    /// Explicit AAD prefix override (base64). When set, used verbatim and
+    /// `table_hint`/`schema_id` are ignored. Read from the table's
+    /// `_encryption.json` marker when the caller knows it.
+    pub aad_prefix_b64: Option<String>,
 }
 
-impl IcefallDBdbEncryptionConfig {
+impl Default for IcefallDBEncryptionConfig {
+    fn default() -> Self {
+        Self {
+            footer_key_id: String::new(),
+            column_key_ids: String::new(),
+            table_hint: String::new(),
+            schema_id: 1,
+            aad_prefix_b64: None,
+        }
+    }
+}
+
+impl IcefallDBEncryptionConfig {
     /// Parse `column_key_ids` into a `BTreeMap<column_name, KeyIdentifier>`.
     pub fn parse_column_keys(&self) -> std::collections::BTreeMap<String, KeyIdentifier> {
         let mut out = std::collections::BTreeMap::new();
@@ -75,6 +92,40 @@ impl IcefallDBdbEncryptionConfig {
             }
         }
         out
+    }
+
+    /// Derive the AAD prefix to supply for decryption, in priority order:
+    ///
+    /// 1. [`Self::aad_prefix_b64`](struct@Self::aad_prefix_b64) — explicit base64
+    ///    override.
+    /// 2. [`Self::table_hint`] + [`Self::schema_id`] — recomputed via
+    ///    [`table_aad_prefix`], matching the writer's derivation.
+    /// 3. neither — empty, i.e. *no* AAD is supplied to the Parquet reader.
+    ///
+    /// Returning empty (case 3) is correct, not a fallback-of-last-resort: the
+    /// IcefallDB writer always stores the AAD prefix in the file footer
+    /// (`store_aad_prefix = true` default), so the reader uses the file's own
+    /// AAD and decryption succeeds. We only forgo cross-table file-swap
+    /// *verification*, which is impossible anyway when the reader does not know
+    /// the table identity. We deliberately never fabricate an AAD from the file
+    /// path — a made-up prefix would mismatch the stored one and fail every
+    /// read's GCM authentication.
+    pub fn derive_aad(&self) -> std::result::Result<Vec<u8>, DataFusionError> {
+        use base64::Engine;
+        if let Some(b64) = self.aad_prefix_b64.as_deref() {
+            let b64 = b64.trim();
+            if !b64.is_empty() {
+                return base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map_err(|e| {
+                        DataFusionError::Configuration(format!("invalid aad_prefix_b64: {e}"))
+                    });
+            }
+        }
+        if !self.table_hint.is_empty() {
+            return Ok(table_aad_prefix(&self.table_hint, self.schema_id));
+        }
+        Ok(Vec::new())
     }
 }
 
@@ -93,9 +144,13 @@ pub async fn load_table_keys(
     let footer = provider.get(footer_kid, aad).await?;
     let mut cols = std::collections::BTreeMap::new();
     for (col, kid) in column_kids {
-        cols.insert(col.clone(), provider.get(kid, aad).await?);
+        cols.insert(
+            col.clone(),
+            provider.get(kid, aad).await?.as_slice().to_vec(),
+        );
     }
-    EncryptionKeySet::with_columns(footer, cols, aad.to_vec()).map_err(map_enc_err)
+    EncryptionKeySet::with_columns(footer.as_slice().to_vec(), cols, aad.to_vec())
+        .map_err(map_enc_err)
 }
 
 /// Build `FileDecryptionProperties` for a table from a key set. This is the
@@ -121,21 +176,21 @@ fn map_enc_err(e: icefalldb_core::IcefallDBError) -> crate::QueryError {
 /// The factory delegates to a [`KeyProvider`] for the actual key bytes. The
 /// provider can be `EnvKeyProvider`, `FileKeyProvider`, `StaticKeyProvider`,
 /// or a custom KMS-backed implementation.
-pub struct IcefallDBdbEncryptionFactory {
+pub struct IcefallDBEncryptionFactory {
     /// Shared key provider. Must be `Send + Sync` (the `KeyProvider` trait
     /// enforces this) because DataFusion partitions read concurrently.
     pub provider: Arc<dyn KeyProvider>,
 }
 
-impl std::fmt::Debug for IcefallDBdbEncryptionFactory {
+impl std::fmt::Debug for IcefallDBEncryptionFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IcefallDBdbEncryptionFactory")
+        f.debug_struct("IcefallDBEncryptionFactory")
             .field("provider", &"<dyn KeyProvider>")
             .finish()
     }
 }
 
-impl IcefallDBdbEncryptionFactory {
+impl IcefallDBEncryptionFactory {
     pub fn new(provider: Arc<dyn KeyProvider>) -> Self {
         Self { provider }
     }
@@ -145,7 +200,7 @@ impl IcefallDBdbEncryptionFactory {
 }
 
 #[async_trait]
-impl EncryptionFactory for IcefallDBdbEncryptionFactory {
+impl EncryptionFactory for IcefallDBEncryptionFactory {
     async fn get_file_encryption_properties(
         &self,
         _options: &EncryptionFactoryOptions,
@@ -167,26 +222,16 @@ impl EncryptionFactory for IcefallDBdbEncryptionFactory {
     async fn get_file_decryption_properties(
         &self,
         options: &EncryptionFactoryOptions,
-        file_path: &ObjectStorePath,
+        _file_path: &ObjectStorePath,
     ) -> std::result::Result<
         Option<Arc<parquet::encryption::decrypt::FileDecryptionProperties>>,
         DataFusionError,
     > {
         let cfg = parse_factory_options(options);
 
+        let aad = cfg.derive_aad()?;
         let column_kids = cfg.parse_column_keys();
         let footer_kid = KeyIdentifier::new(cfg.footer_key_id);
-        let schema_hint = cfg.table_hint;
-        let aad = if schema_hint.is_empty() {
-            // No hint → derive a weak AAD from the file path so different files
-            // still get different AADs.
-            let path_str = file_path.to_string();
-            table_aad_prefix(&path_str, 0)
-        } else {
-            // Use the configured table name; assume schema_id 1 for now. A
-            // future revision will thread the actual schema_id through.
-            table_aad_prefix(&schema_hint, 1)
-        };
 
         let keys = load_table_keys(self.provider.as_ref(), &footer_kid, &column_kids, &aad)
             .await
@@ -200,40 +245,94 @@ impl EncryptionFactory for IcefallDBdbEncryptionFactory {
 }
 
 /// Parse the factory options into our typed config struct.
-fn parse_factory_options(options: &EncryptionFactoryOptions) -> IcefallDBdbEncryptionConfig {
+fn parse_factory_options(options: &EncryptionFactoryOptions) -> IcefallDBEncryptionConfig {
     // `EncryptionFactoryOptions.options` is a free-form `HashMap<String, String>`
     // populated from `format.crypto.factory_options.<key>` session config
-    // values.
+    // values. Each key is accepted either bare (`footer_key_id`) or under the
+    // `icefalldb.encryption.*` namespace.
     let opts = &options.options;
-    let footer_key_id = opts
-        .get("footer_key_id")
-        .or_else(|| opts.get("icefalldb.encryption.footer_key_id"))
-        .cloned()
-        .unwrap_or_default();
-    let column_key_ids = opts
-        .get("column_key_ids")
-        .or_else(|| opts.get("icefalldb.encryption.column_key_ids"))
-        .cloned()
-        .unwrap_or_default();
-    let table_hint = opts
-        .get("table_hint")
-        .or_else(|| opts.get("icefalldb.encryption.table_hint"))
-        .cloned()
-        .unwrap_or_default();
-    let plaintext_footer_str = opts
-        .get("plaintext_footer")
-        .or_else(|| opts.get("icefalldb.encryption.plaintext_footer"))
-        .map(|s| s.as_str())
-        .unwrap_or("true");
-    let plaintext_footer = !matches!(
-        plaintext_footer_str.to_lowercase().as_str(),
-        "false" | "0" | "no" | "off"
-    );
+    let get = |key: &str| -> Option<String> {
+        opts.get(key)
+            .or_else(|| opts.get(&format!("icefalldb.encryption.{key}")))
+            .cloned()
+    };
 
-    IcefallDBdbEncryptionConfig {
-        footer_key_id,
-        column_key_ids,
-        table_hint,
-        plaintext_footer,
+    let schema_id = get("schema_id")
+        .map(|s| s.trim().parse::<u64>().unwrap_or(1))
+        .unwrap_or(1);
+
+    IcefallDBEncryptionConfig {
+        footer_key_id: get("footer_key_id").unwrap_or_default(),
+        column_key_ids: get("column_key_ids").unwrap_or_default(),
+        table_hint: get("table_hint").unwrap_or_default(),
+        schema_id,
+        aad_prefix_b64: get("aad_prefix_b64"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_aad_empty_when_no_identity() {
+        // No table_hint and no explicit AAD → empty. The reader then uses the
+        // file's stored AAD. This must NOT be a fabricated path-derived value,
+        // which would mismatch the stored prefix and fail authentication.
+        assert!(IcefallDBEncryptionConfig::default()
+            .derive_aad()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn derive_aad_from_table_hint() {
+        let c = IcefallDBEncryptionConfig {
+            table_hint: "events".into(),
+            ..Default::default()
+        };
+        assert_eq!(c.derive_aad().unwrap(), table_aad_prefix("events", 1));
+    }
+
+    #[test]
+    fn derive_aad_from_table_hint_and_schema_id() {
+        let c = IcefallDBEncryptionConfig {
+            table_hint: "events".into(),
+            schema_id: 7,
+            ..Default::default()
+        };
+        assert_eq!(c.derive_aad().unwrap(), table_aad_prefix("events", 7));
+    }
+
+    #[test]
+    fn derive_aad_explicit_override_wins() {
+        let c = IcefallDBEncryptionConfig {
+            table_hint: "events".into(),
+            aad_prefix_b64: Some("Y3VzdG9tLWFhZA==".into()), // b"custom-aad"
+            ..Default::default()
+        };
+        assert_eq!(c.derive_aad().unwrap(), b"custom-aad");
+    }
+
+    #[test]
+    fn derive_aad_blank_override_falls_through() {
+        // A whitespace-only explicit override is treated as unset so the
+        // table_hint path still applies.
+        let c = IcefallDBEncryptionConfig {
+            table_hint: "events".into(),
+            aad_prefix_b64: Some("  ".into()),
+            ..Default::default()
+        };
+        assert_eq!(c.derive_aad().unwrap(), table_aad_prefix("events", 1));
+    }
+
+    #[test]
+    fn derive_aad_rejects_bad_base64() {
+        let c = IcefallDBEncryptionConfig {
+            aad_prefix_b64: Some("!!!not-base64!!!".into()),
+            ..Default::default()
+        };
+        let err = c.derive_aad().unwrap_err();
+        assert!(err.to_string().contains("aad_prefix_b64"));
     }
 }

@@ -170,8 +170,11 @@ async fn read_enc_marker(
         .read(&path)
         .await
         .map_err(|e| PyRuntimeError::new_err(format!("read {path}: {e:?}")))?;
-    let marker = serde_json::from_slice(&bytes)
+    let marker: SchemaEncryptionMarker = serde_json::from_slice(&bytes)
         .map_err(|e| PyRuntimeError::new_err(format!("parse {path}: {e}")))?;
+    marker
+        .validate()
+        .map_err(|e| PyRuntimeError::new_err(format!("validating {path}: {e}")))?;
     Ok(Some(marker))
 }
 

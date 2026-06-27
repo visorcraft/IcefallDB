@@ -1925,9 +1925,11 @@ fn build_native_bulk_decode_plan(
 }
 
 /// Read the AAD prefix for an encrypted table from its `_encryption.json`
-/// marker. Returns an empty `Vec` if the marker is absent or malformed,
-/// in which case the caller (or the file itself, when `with_aad_prefix_storage(true)`
-/// was used at write time) provides the AAD.
+/// marker. Returns an empty `Vec` if the marker is absent or unparseable, in
+/// which case the caller (or the file itself, when `with_aad_prefix_storage(true)`
+/// was used at write time) provides the AAD. A marker that parses cleanly but
+/// advertises an unknown algorithm is rejected (propagated as an error) rather
+/// than silently treated as decryptable.
 #[cfg(feature = "encryption")]
 async fn read_table_aad_prefix(storage: &Arc<dyn Storage>, table: &str) -> Result<Vec<u8>> {
     use base64::Engine;
@@ -1942,6 +1944,8 @@ async fn read_table_aad_prefix(storage: &Arc<dyn Storage>, table: &str) -> Resul
         Ok(m) => m,
         Err(_) => return Ok(Vec::new()),
     };
+    // A well-formed marker must advertise a scheme we know how to read.
+    marker.validate()?;
     Ok(marker
         .aad_prefix
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())

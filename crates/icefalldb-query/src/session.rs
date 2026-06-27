@@ -118,10 +118,10 @@ mod encryption_session {
     use datafusion::execution::SessionState;
     use icefalldb_core::encryption::provider::KeyProvider;
 
-    use crate::encryption::IcefallDBdbEncryptionFactory;
+    use crate::encryption::IcefallDBEncryptionFactory;
 
-    /// Build a `SessionState` with a [`IcefallDBdbEncryptionFactory`] registered
-    /// on the `RuntimeEnv` under [`IcefallDBdbEncryptionFactory::FACTORY_ID`].
+    /// Build a `SessionState` with a [`IcefallDBEncryptionFactory`] registered
+    /// on the `RuntimeEnv` under [`IcefallDBEncryptionFactory::FACTORY_ID`].
     /// Tables opt into encryption by setting
     /// `format.crypto.factory_id = "icefalldb"` in their session config.
     pub fn icefalldb_encrypted_session_state(
@@ -135,8 +135,8 @@ mod encryption_session {
             .with_optimizer_rule(Arc::new(crate::rules::SimplifyCastPredicates::new()))
             .build();
         let _previous = state.runtime_env().register_parquet_encryption_factory(
-            IcefallDBdbEncryptionFactory::FACTORY_ID,
-            Arc::new(IcefallDBdbEncryptionFactory::new(provider)),
+            IcefallDBEncryptionFactory::FACTORY_ID,
+            Arc::new(IcefallDBEncryptionFactory::new(provider)),
         );
         crate::rules::register_icefalldb_rules(state)
     }

@@ -233,14 +233,16 @@ cargo run -p icefalldb-server -- --host 0.0.0.0 --port 8080 /tmp/mydb
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings        # default build must be clean
-cargo test --workspace
-cargo test -p icefalldb-query --features sketches # optional approximate aggregates
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 
 # Python gates (venv at python/.venv)
 python/.venv/bin/ruff check python
+python/.venv/bin/ruff format --check python
 python/.venv/bin/python -m pytest python/tests -q
 ```
+
+`AGENTS.md` is the authoritative source for gates, invariants, and conventions.
 
 Benchmark suites live under `python/benchmarks/`: `datafusion/` (query/throughput
 matrix), `mutations/` (write and rewrite cost), and `perf/` (open / commit /
@@ -250,14 +252,15 @@ are in [`AGENTS.md`](AGENTS.md).
 ## Project layout
 
 ```text
-crates/icefalldb-core/      storage, metadata, writer (mutations, compaction, GC),
-                            reader, rowindex, deletion vectors, agg_cache, encryption
-crates/icefalldb-query/     native DataFusion 54 engine + optimizer rules + caches
-crates/icefalldb-query-py/  PyO3 extension (sql + mutate)
-crates/icefalldb-server/    HTTP SQL server (axum)
-crates/icefalldb-cli/       `icefalldb` binary
-python/                     Python adapter + benchmarks
-docs/                       user guide
+crates/icefalldb-core/                storage, metadata, writer (mutations, compaction, GC),
+                                      reader, rowindex, deletion vectors, agg_cache, encryption
+crates/icefalldb-query/               native DataFusion 54 engine + optimizer rules + caches
+crates/icefalldb-query-py/            PyO3 extension (sql + mutate)
+crates/icefalldb-server/              HTTP SQL server (axum) + optional /mutate daemon
+crates/icefalldb-cli/                 `icefalldb` binary
+crates/datafusion-encrypted-parquet/  standalone encrypted-Parquet factory for DataFusion
+python/                               Python adapter + benchmarks
+docs/                                 user guide
 ```
 
 ## Documentation

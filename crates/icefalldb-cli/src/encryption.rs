@@ -51,7 +51,11 @@ pub async fn read_marker(
         return Ok(None);
     }
     let bytes = storage.read(&path).await?;
-    let marker = serde_json::from_slice(&bytes).with_context(|| format!("parsing {path}"))?;
+    let marker: SchemaEncryptionMarker =
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {path}"))?;
+    marker
+        .validate()
+        .with_context(|| format!("validating {path}"))?;
     Ok(Some(marker))
 }
 
@@ -76,7 +80,7 @@ pub async fn write_config(
         .with_context(|| format!("resolving footer key '{footer_id}'"))?;
 
     let keyset = if spec.columns.is_empty() {
-        EncryptionKeySet::footer_only(footer, aad.clone())
+        EncryptionKeySet::footer_only(footer.as_slice().to_vec(), aad.clone())
             .map_err(|e| anyhow!("invalid footer key: {e}"))?
     } else {
         let mut cols = BTreeMap::new();
@@ -86,9 +90,9 @@ pub async fn write_config(
                 .get(&kid, &aad)
                 .await
                 .with_context(|| format!("resolving column key '{kid}'"))?;
-            cols.insert(col.clone(), bytes);
+            cols.insert(col.clone(), bytes.as_slice().to_vec());
         }
-        EncryptionKeySet::with_columns(footer, cols, aad.clone())
+        EncryptionKeySet::with_columns(footer.as_slice().to_vec(), cols, aad.clone())
             .map_err(|e| anyhow!("invalid key set: {e}"))?
     };
 

@@ -11,6 +11,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::encryption::EncryptionKeySet;
+use crate::error::{IcefallDBError, Result};
 
 /// Per-table write-time encryption configuration.
 ///
@@ -110,6 +111,28 @@ impl SchemaEncryptionMarker {
     /// Marker algorithm identifier for Parquet Modular Encryption v1.
     pub const ALGORITHM: &'static str = "parquet-modular-encryption-v1";
 
+    /// Validate that this marker describes an encryption scheme the reader
+    /// supports.
+    ///
+    /// Readers must call this after deserialising a marker so an unknown
+    /// algorithm identifier is rejected up front — rather than being silently
+    /// treated as decryptable and producing a confusing GCM auth-tag failure
+    /// deep inside the Parquet decoder (or, worse, a plaintext read if the
+    /// file is not actually encrypted). The writer-side reopen path already
+    /// compares the algorithm field directly; this is the reader-side gate.
+    pub fn validate(&self) -> Result<()> {
+        if self.algorithm != Self::ALGORITHM {
+            return Err(IcefallDBError::Encryption(format!(
+                "unsupported encryption algorithm '{}'; expected '{}'. The reader \
+                 refuses to decrypt a file with an unknown algorithm rather than \
+                 guessing — rotate via an explicit migration once support lands.",
+                self.algorithm,
+                Self::ALGORITHM
+            )));
+        }
+        Ok(())
+    }
+
     /// Build a marker from a writer's config and a footer key identifier.
     pub fn for_write_config(
         footer_key_id: impl Into<String>,
@@ -189,6 +212,15 @@ mod tests {
             "plaintext_footer": true
         }"#;
         let marker: SchemaEncryptionMarker = serde_json::from_str(json).unwrap();
-        assert_ne!(marker.algorithm, SchemaEncryptionMarker::ALGORITHM);
+        let err = marker.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unsupported encryption algorithm"),
+            "expected an unsupported-algorithm error, got: {msg}"
+        );
+        // Positive control: the canonical marker validates.
+        let cfg = EncryptionWriteConfig::new(sample_keys());
+        let good = SchemaEncryptionMarker::for_write_config("events-v1", &cfg);
+        good.validate().expect("canonical marker validates");
     }
 }

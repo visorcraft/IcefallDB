@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use zeroize::Zeroizing;
 
 use crate::encryption::keys::{validate_key, KeyIdentifier};
 use crate::error::{IcefallDBError, Result};
@@ -38,9 +39,15 @@ pub const KEY_ID_ENV_PREFIX: &str = "ICEFALLDB_KEY_";
 /// single process: the same key id must always resolve to the same bytes.
 /// `aad` is provided so KMS-backed implementations can authenticate key
 /// retrieval; static providers may ignore it.
+///
+/// The returned bytes are wrapped in [`Zeroizing`] so they are wiped from
+/// memory when the caller drops them. Implementations should also keep their
+/// cached material in `Zeroizing` buffers — key bytes that outlive a single
+/// lookup (provider caches) must not sit in plaintext `Vec`s for the process
+/// lifetime.
 #[async_trait]
 pub trait KeyProvider: Send + Sync {
-    async fn get(&self, kid: &KeyIdentifier, aad: &[u8]) -> Result<Vec<u8>>;
+    async fn get(&self, kid: &KeyIdentifier, aad: &[u8]) -> Result<Zeroizing<Vec<u8>>>;
 
     /// Return every key identifier this provider knows about. Used by writers
     /// that want to fail fast on unknown key references at startup.
@@ -70,7 +77,7 @@ impl EnvKeyProvider {
 
 #[async_trait]
 impl KeyProvider for EnvKeyProvider {
-    async fn get(&self, kid: &KeyIdentifier, _aad: &[u8]) -> Result<Vec<u8>> {
+    async fn get(&self, kid: &KeyIdentifier, _aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let var = Self::env_var_name(kid);
         let raw = env::var(&var).map_err(|_| {
             IcefallDBError::EncryptionKeyNotFound(format!("env var {var} for key id '{kid}'"))
@@ -79,7 +86,7 @@ impl KeyProvider for EnvKeyProvider {
             IcefallDBError::Encryption(format!("env var {var} is not valid hex ({e})"))
         })?;
         validate_key(&bytes)?;
-        Ok(bytes)
+        Ok(Zeroizing::new(bytes))
     }
 
     async fn known(&self) -> Result<Vec<KeyIdentifier>> {
@@ -106,8 +113,9 @@ impl KeyProvider for EnvKeyProvider {
 ///
 /// The file is read lazily on first access and then cached. Call
 /// [`FileKeyProvider::reload`] to invalidate the cache.
-/// Cached key map: `KeyIdentifier` → key bytes.
-type KeyCache = HashMap<KeyIdentifier, Vec<u8>>;
+/// Cached key map: `KeyIdentifier` → key bytes (held in [`Zeroizing`] so cached
+/// keys are wiped when the provider is dropped).
+type KeyCache = HashMap<KeyIdentifier, Zeroizing<Vec<u8>>>;
 
 #[derive(Debug, Clone)]
 pub struct FileKeyProvider {
@@ -151,12 +159,12 @@ impl FileKeyProvider {
                 ))
             })?;
             validate_key(&bytes)?;
-            out.insert(KeyIdentifier(id), bytes);
+            out.insert(KeyIdentifier(id), Zeroizing::new(bytes));
         }
         Ok(out)
     }
 
-    fn get_cached(&self, kid: &KeyIdentifier) -> Result<Option<Vec<u8>>> {
+    fn get_cached(&self, kid: &KeyIdentifier) -> Result<Option<Zeroizing<Vec<u8>>>> {
         // Try read-locked fast path first.
         if let Ok(read) = self.cache.read() {
             if let Some(map) = read.as_ref() {
@@ -175,7 +183,7 @@ impl FileKeyProvider {
 
 #[async_trait]
 impl KeyProvider for FileKeyProvider {
-    async fn get(&self, kid: &KeyIdentifier, _aad: &[u8]) -> Result<Vec<u8>> {
+    async fn get(&self, kid: &KeyIdentifier, _aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         self.get_cached(kid)?
             .ok_or_else(|| IcefallDBError::EncryptionKeyNotFound(kid.to_string()))
     }
@@ -197,25 +205,27 @@ impl KeyProvider for FileKeyProvider {
 /// Static (programmatic) provider. The caller hands in a map of
 /// `KeyIdentifier` → key bytes. Used by the Python adapter, which resolves
 /// keys via a Python callback at session-build time.
+///
+/// Key bytes are held in [`Zeroizing`] buffers so they are wiped when the
+/// provider is dropped.
 #[derive(Debug, Default, Clone)]
 pub struct StaticKeyProvider {
-    keys: HashMap<KeyIdentifier, Vec<u8>>,
+    keys: HashMap<KeyIdentifier, Zeroizing<Vec<u8>>>,
 }
 
 impl StaticKeyProvider {
-    pub fn new<I>(keys: I) -> Self
+    pub fn new<I>(keys: I) -> Result<Self>
     where
         I: IntoIterator<Item = (KeyIdentifier, Vec<u8>)>,
     {
         let mut map = HashMap::new();
         for (id, bytes) in keys {
-            if let Err(e) = validate_key(&bytes) {
-                tracing::warn!(kid = %id, error = %e, "skipping invalid-length key");
-                continue;
-            }
-            map.insert(id, bytes);
+            validate_key(&bytes).map_err(|e| {
+                IcefallDBError::Encryption(format!("invalid key length for key id '{id}': {e}"))
+            })?;
+            map.insert(id, Zeroizing::new(bytes));
         }
-        Self { keys: map }
+        Ok(Self { keys: map })
     }
 
     pub fn from_key_set(
@@ -225,20 +235,23 @@ impl StaticKeyProvider {
         use crate::encryption::config::footer_key_id_for_column;
         let mut map = HashMap::new();
         let footer_id: KeyIdentifier = footer_id.into();
-        map.insert(footer_id.clone(), keys.footer_bytes().to_vec());
+        map.insert(
+            footer_id.clone(),
+            Zeroizing::new(keys.footer_bytes().to_vec()),
+        );
         // Populate per-column key ids using the documented convention so that
         // readers looking up `<footer-id>:<column>` succeed. Without this,
         // readers would get `EncryptionKeyNotFound` for any column key.
         for (name, bytes) in keys.column_pairs() {
             let kid = KeyIdentifier::new(footer_key_id_for_column(footer_id.as_str(), name));
-            map.insert(kid, bytes.to_vec());
+            map.insert(kid, Zeroizing::new(bytes.to_vec()));
         }
         Self { keys: map }
     }
 
     pub fn insert(&mut self, id: impl Into<KeyIdentifier>, bytes: Vec<u8>) -> Result<()> {
         validate_key(&bytes)?;
-        self.keys.insert(id.into(), bytes);
+        self.keys.insert(id.into(), Zeroizing::new(bytes));
         Ok(())
     }
 
@@ -251,7 +264,7 @@ impl StaticKeyProvider {
 
 #[async_trait]
 impl KeyProvider for StaticKeyProvider {
-    async fn get(&self, kid: &KeyIdentifier, _aad: &[u8]) -> Result<Vec<u8>> {
+    async fn get(&self, kid: &KeyIdentifier, _aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         self.keys
             .get(kid)
             .cloned()
@@ -284,7 +297,7 @@ mod tests {
             .get(&KeyIdentifier::new("events-v1"), b"aad")
             .await
             .unwrap();
-        assert_eq!(got, k16("0123456789abcdef"));
+        assert_eq!(got.as_slice(), k16("0123456789abcdef").as_slice());
         let err = p
             .get(&KeyIdentifier::new("does-not-exist"), b"aad")
             .await
@@ -303,7 +316,7 @@ mod tests {
             .get(&KeyIdentifier::new("events-v1"), b"aad")
             .await
             .unwrap();
-        assert_eq!(got, k16("0123456789abcdef"));
+        assert_eq!(got.as_slice(), k16("0123456789abcdef").as_slice());
     }
 
     #[tokio::test]
@@ -320,7 +333,7 @@ mod tests {
             .get(&KeyIdentifier::new("events-v1"), b"aad")
             .await
             .unwrap();
-        assert_eq!(got, k16("0123456789abcdef"));
+        assert_eq!(got.as_slice(), k16("0123456789abcdef").as_slice());
         assert_eq!(p.known().await.unwrap().len(), 1);
     }
 }

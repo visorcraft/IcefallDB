@@ -106,16 +106,22 @@ impl EncryptionFactory for FactoryAdapter {
                 if pair.is_empty() {
                     continue;
                 }
-                if let Some((col, kid)) = pair.split_once('=') {
-                    let key = self.keys.get(kid.trim())?;
-                    builder = builder.with_column_key(col.trim(), key);
-                }
+                let Some((col, kid)) = pair.split_once('=') else {
+                    return Err(DataFusionError::Configuration(format!(
+                        "invalid column_key_ids entry '{pair}'; expected '<column>=<key_id>'"
+                    )));
+                };
+                let key = self.keys.get(kid.trim())?;
+                builder = builder.with_column_key(col.trim(), key);
             }
         }
         if let Some(aad) = options.options.get("aad_prefix_b64") {
-            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(aad) {
-                builder = builder.with_aad_prefix(bytes);
-            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(aad)
+                .map_err(|e| {
+                    DataFusionError::Configuration(format!("invalid aad_prefix_b64: {e}"))
+                })?;
+            builder = builder.with_aad_prefix(bytes);
         }
         let props = builder
             .build()
