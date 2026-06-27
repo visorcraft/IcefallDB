@@ -216,6 +216,21 @@ fn make_full_provider(table: &str) -> Arc<dyn KeyProvider> {
     Arc::new(StaticKeyProvider::new(keys).unwrap())
 }
 
+fn b_column_key_ids(table: &str) -> BTreeMap<String, KeyIdentifier> {
+    let mut keys = BTreeMap::new();
+    keys.insert("b".to_string(), KeyIdentifier::new(format!("{table}-v1:b")));
+    keys
+}
+
+fn assert_missing_b_key(msg: &str) {
+    assert!(
+        msg.contains("t-v1:b")
+            || msg.contains("encryption key not found")
+            || msg.contains("EncryptionKeyNotFound"),
+        "unexpected error: {msg}"
+    );
+}
+
 async fn create_per_column_encrypted_table(root: &std::path::Path) -> Arc<dyn Storage> {
     let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(root).unwrap());
     let icefalldb_schema = arrow_schema_to_icefalldb(make_batch().schema());
@@ -249,6 +264,51 @@ fn encrypted_provider_config() -> ProviderConfig {
 }
 
 #[tokio::test]
+async fn encrypted_provider_requires_valid_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = create_encrypted_table(tmp.path()).await;
+
+    storage.delete("t/_encryption.json").await.unwrap();
+    let err = IcefallDBTableProvider::new_encrypted(
+        Arc::clone(&storage),
+        "t",
+        encrypted_provider_config(),
+        make_provider("t"),
+        KeyIdentifier::new("t-v1"),
+        BTreeMap::new(),
+    )
+    .await
+    .expect_err("encrypted provider must reject a missing marker");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("_encryption.json"),
+        "expected marker-specific error, got: {msg}"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = create_encrypted_table(tmp.path()).await;
+    storage
+        .write("t/_encryption.json", b"{not-json")
+        .await
+        .unwrap();
+    let err = IcefallDBTableProvider::new_encrypted(
+        Arc::clone(&storage),
+        "t",
+        encrypted_provider_config(),
+        make_provider("t"),
+        KeyIdentifier::new("t-v1"),
+        BTreeMap::new(),
+    )
+    .await
+    .expect_err("encrypted provider must reject a malformed marker");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("failed to parse"),
+        "expected parse error, got: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn per_column_encrypted_plaintext_projection_without_column_key() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = create_per_column_encrypted_table(tmp.path()).await;
@@ -259,7 +319,7 @@ async fn per_column_encrypted_plaintext_projection_without_column_key() {
         encrypted_provider_config(),
         make_footer_only_provider("t"),
         KeyIdentifier::new("t-v1"),
-        BTreeMap::new(),
+        b_column_key_ids("t"),
     )
     .await
     .expect("open encrypted provider with footer key only");
@@ -302,10 +362,7 @@ async fn per_column_encrypted_plaintext_projection_without_column_key() {
         .await
         .expect_err("filter on encrypted column without key should fail");
     let msg = err.to_string();
-    assert!(
-        msg.contains("'b'") || msg.contains("EncryptionKeyNotFound"),
-        "unexpected error: {msg}"
-    );
+    assert_missing_b_key(&msg);
 }
 
 #[tokio::test]
@@ -319,7 +376,7 @@ async fn per_column_encrypted_missing_column_key_error() {
         encrypted_provider_config(),
         make_footer_only_provider("t"),
         KeyIdentifier::new("t-v1"),
-        BTreeMap::new(),
+        b_column_key_ids("t"),
     )
     .await
     .unwrap();
@@ -335,10 +392,7 @@ async fn per_column_encrypted_missing_column_key_error() {
         .await
         .expect_err("projecting encrypted column without key should fail");
     let msg = err.to_string();
-    assert!(
-        msg.contains("'b'") || msg.contains("EncryptionKeyNotFound"),
-        "unexpected error: {msg}"
-    );
+    assert_missing_b_key(&msg);
 }
 
 #[tokio::test]
@@ -352,11 +406,7 @@ async fn per_column_encrypted_with_column_key_roundtrip() {
         encrypted_provider_config(),
         make_full_provider("t"),
         KeyIdentifier::new("t-v1"),
-        {
-            let mut m = BTreeMap::new();
-            m.insert("b".to_string(), KeyIdentifier::new("t-v1:b"));
-            m
-        },
+        b_column_key_ids("t"),
     )
     .await
     .unwrap();

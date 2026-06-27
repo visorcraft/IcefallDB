@@ -27,7 +27,6 @@
 /// This module stores ONLY the new additive primitives `{count_non_null, sum,
 /// sumsq}`.  The metadata-aggregate rule composes SUM/AVG/VAR/STDDEV from these and
 /// MIN/MAX from `ColumnStats`.
-// ponytail: do not add min/max here — they duplicate ColumnStats
 use arrow::array::{
     Array, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch,
     UInt16Array, UInt32Array, UInt64Array, UInt8Array,

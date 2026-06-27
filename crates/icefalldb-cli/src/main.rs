@@ -319,12 +319,7 @@ fn main() -> ExitCode {
             encrypt_footer,
             key_file,
         } => {
-            let enc = ImportEncryption {
-                whole_table: encrypt,
-                columns: encrypt_column,
-                encrypt_footer,
-                key_file,
-            };
+            let enc = ImportEncryption::new(encrypt, encrypt_column, encrypt_footer, key_file);
             match run_import(&db, &table, &file, enc).await {
                 Ok(rows) => {
                     println!("imported {} rows into {}", rows, table);
@@ -734,17 +729,45 @@ async fn run_insert(db: &Path, table: &str, file: &Path) -> anyhow::Result<()> {
 
 /// Encryption options for `import`, carried independently of the optional
 /// `encryption` feature. Conversion to a real key set happens under
-/// `#[cfg(feature = "encryption")]` in [`run_import`]; with the feature off,
-/// `encrypt_footer`/`key_file` are unused, hence the conditional `allow`.
-#[cfg_attr(not(feature = "encryption"), allow(dead_code))]
+/// `#[cfg(feature = "encryption")]` in [`run_import`].
 struct ImportEncryption {
     whole_table: bool,
     columns: Vec<String>,
+    #[cfg(feature = "encryption")]
     encrypt_footer: bool,
+    #[cfg(feature = "encryption")]
     key_file: Option<PathBuf>,
 }
 
 impl ImportEncryption {
+    #[cfg(feature = "encryption")]
+    fn new(
+        whole_table: bool,
+        columns: Vec<String>,
+        encrypt_footer: bool,
+        key_file: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            whole_table,
+            columns,
+            encrypt_footer,
+            key_file,
+        }
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    fn new(
+        whole_table: bool,
+        columns: Vec<String>,
+        _encrypt_footer: bool,
+        _key_file: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            whole_table,
+            columns,
+        }
+    }
+
     fn enabled(&self) -> bool {
         self.whole_table || !self.columns.is_empty()
     }

@@ -848,17 +848,10 @@ impl Writer {
             None
         };
 
-        // Content-addressed dedup (referencing an already-committed identical
-        // data file instead of copying it) skips row-id allocation and all index
-        // maintenance. That is unsafe when a UNIQUE index exists: the
-        // re-referenced fragment would re-add the same keys as live rows, with
-        // duplicate row_ids and no uniqueness probe, silently violating the
-        // invariant in a way later index rebuilds cannot even detect. When the
-        // table has a unique index, fall through to the normal copy path, which
-        // allocates fresh row_ids and runs `check_unique_adds` (rejecting the
-        // duplicate keys).
-        // ponytail: gate on unique indexes only; non-unique index staleness in
-        // the dedup path is a separate, pre-existing concern outside M01 scope.
+        // Content-addressed dedup references an already-committed identical data
+        // file instead of copying it. Unique indexes still use the normal copy
+        // path so `maintain_on_insert` can probe the existing generation and
+        // reject duplicate keys before the dedup branch writes a new sidecar.
         let dedup_allowed = {
             let catalog = crate::database_catalog::DatabaseCatalog::new(self.storage.clone());
             let catalog_data = catalog.load().await?;
@@ -966,11 +959,16 @@ impl Writer {
         let fragment_id = current_manifest.next_fragment_id;
         let next_fragment_id = fragment_id + 1;
 
-        // Read the existing meta, change only the row_group id, and recompute its checksum.
+        // Read the existing meta, assign a fresh row-group id and fresh stable
+        // row IDs for this logical append, then recompute the metadata checksum.
+        // The Parquet bytes are shared, but row IDs must remain globally unique.
         let existing_meta_path = format!("{}/{}", self.table, existing.meta);
         let existing_meta_bytes = self.storage.read(&existing_meta_path).await?;
         let mut meta: RowGroupMeta = serde_json::from_slice(&existing_meta_bytes)?;
         meta.row_group = rg_id;
+        let mut next_row_id = current_manifest.next_row_id;
+        let row_id_seg = allocate_range(&mut next_row_id, meta.rows as u64);
+        meta.row_ids = vec![row_id_seg];
         meta.compute_meta_checksum()?;
         let meta_json = serde_json::to_vec(&meta)?;
         self.storage.write(&meta_path, &meta_json).await?;
@@ -1020,7 +1018,7 @@ impl Writer {
             } else {
                 Some(partition_values_map)
             },
-            next_row_id: current_manifest.next_row_id,
+            next_row_id,
             next_fragment_id,
             checksum: String::new(),
             ..Default::default()
@@ -1055,6 +1053,20 @@ impl Writer {
         self.storage.sync_data(&intent_path).await?;
         self.storage
             .sync(&format!("{}/_staging/intents", self.table))
+            .await?;
+
+        // Dedup reuses an existing data filename, so the append-delta path
+        // cannot identify it as a new fragment by data path. Rebuild indexes for
+        // this snapshot to include the fresh row IDs from the new sidecar.
+        intent_files = self
+            .build_indexes_into_manifest(
+                &mut manifest,
+                current_manifest,
+                std::slice::from_ref(&meta_filename),
+                &intent_path,
+                &txn_id,
+                false,
+            )
             .await?;
 
         let mut _staged_for_rollback = Vec::new();

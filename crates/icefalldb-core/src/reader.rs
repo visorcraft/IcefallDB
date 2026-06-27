@@ -129,7 +129,7 @@ pub struct PlannedRowGroup {
     /// if one exists and is valid. `None` when the fragment has no `.agg` file
     /// (e.g. UPDATE/MERGE/compaction fragments) or when the sidecar could not be
     /// read. The metadata-aggregate rule falls back for any fragment where this is `None`.
-    // ponytail: loaded on every scan of a clean fragment (cached after first touch).
+    // Loaded on every scan of a clean fragment and cached after first touch.
     pub agg_state: Option<std::sync::Arc<FragmentAggState>>,
 }
 
@@ -815,8 +815,8 @@ async fn build_scan_plan_from(
                     // the path→content mapping is permanent and the cached value is
                     // always valid. Schema-id was verified at insert time.
                     //
-                    // ponytail: keep PlannedRowGroup.meta as RowGroupMeta (value) for
-                    // now; cloning from Arc is ~100× cheaper than read+parse+checksum.
+                    // Keep PlannedRowGroup.meta as RowGroupMeta (value) for now;
+                    // cloning from Arc is far cheaper than read+parse+checksum.
                     // Upgrade PlannedRowGroup.meta to Arc<RowGroupMeta> in the next
                     // pass if this clone shows up in a profile.
                     if let Some(cached) = cache.get(&meta_path) {

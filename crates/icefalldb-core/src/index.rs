@@ -574,9 +574,8 @@ pub async fn load_index_overlay(
         };
         // Tombstones first (matching apply_deltas): a row id that was added by an
         // earlier delta and is tombstoned now must not survive, so drop it from
-        // the pending adds too. (O(adds) per tombstone — deltas are small and
-        // folded into a new base at compaction. ponytail: revisit if a hot table
-        // accumulates many deltas before optimize.)
+        // the pending adds too. This is O(adds) per tombstone, but deltas are
+        // expected to stay small and are folded into a new base at compaction.
         for id in &delta.tombstoned_row_ids {
             overlay.tombstones.insert(*id);
             for ids in overlay.adds.values_mut() {

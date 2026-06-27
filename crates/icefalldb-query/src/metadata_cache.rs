@@ -204,7 +204,7 @@ impl ParquetMetadataCache {
     }
 
     /// Remove all entries from the cache.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn clear(&self) {
         let Ok(mut guard) = self.inner.write() else {
             return;

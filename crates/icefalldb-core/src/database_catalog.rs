@@ -150,12 +150,15 @@ impl DatabaseCatalog {
 }
 
 /// Opaque token proving the caller holds `_catalog.lock`.
-#[allow(dead_code)]
-pub struct CatalogLockGuard(Box<dyn crate::storage::LockGuard>);
+pub struct CatalogLockGuard {
+    _guard: Box<dyn crate::storage::LockGuard>,
+}
 
 impl DatabaseCatalog {
     pub async fn acquire_lock(&self, timeout: Duration) -> Result<CatalogLockGuard> {
-        Ok(CatalogLockGuard(self.lock(timeout).await?))
+        Ok(CatalogLockGuard {
+            _guard: self.lock(timeout).await?,
+        })
     }
 }
 

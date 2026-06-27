@@ -147,11 +147,15 @@ pub async fn load_table_keys(
     for (col, kid) in column_kids {
         cols.insert(
             col.clone(),
-            provider.get(kid, aad).await?.as_slice().to_vec(),
+            Zeroizing::new(provider.get(kid, aad).await?.as_slice().to_vec()),
         );
     }
-    EncryptionKeySet::with_columns(footer.as_slice().to_vec(), cols, aad.to_vec())
-        .map_err(map_enc_err)
+    EncryptionKeySet::with_columns_zeroizing(
+        Zeroizing::new(footer.as_slice().to_vec()),
+        cols,
+        aad.to_vec(),
+    )
+    .map_err(map_enc_err)
 }
 
 /// Build `FileDecryptionProperties` for a table from a key set. This is the

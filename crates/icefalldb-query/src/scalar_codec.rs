@@ -1,9 +1,7 @@
 //! Lossless conversion between JSON sidecar statistics and Arrow `ScalarValue`.
 //!
 //! The public direction (`json_to_scalar_value`) is used by the statistics builder
-//! to turn per-row-group min/max values into DataFusion `ScalarValue`s. The
-//! private inverse (`scalar_value_to_json`) is kept for symmetry and will be used
-//! by future writers that emit sidecar statistics from Arrow batches.
+//! to turn per-row-group min/max values into DataFusion `ScalarValue`s.
 
 use arrow::datatypes::{DataType, TimeUnit};
 use base64::engine::{general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -98,47 +96,6 @@ pub fn json_to_scalar_value(
     }
 }
 
-/// Convert an Arrow `ScalarValue` back to a JSON value.
-///
-/// Non-finite floats are encoded as strings so the conversion is reversible.
-/// Decimal values are emitted as strings of their unscaled integer to avoid
-/// JSON precision loss. Binary values are base64-encoded.
-#[allow(dead_code)]
-fn scalar_value_to_json(value: &ScalarValue) -> Option<Value> {
-    match value {
-        ScalarValue::Int8(Some(v)) => Some(Value::from(*v as i64)),
-        ScalarValue::Int16(Some(v)) => Some(Value::from(*v as i64)),
-        ScalarValue::Int32(Some(v)) => Some(Value::from(*v as i64)),
-        ScalarValue::Int64(Some(v)) => Some(Value::from(*v)),
-        ScalarValue::UInt8(Some(v)) => Some(Value::from(*v as u64)),
-        ScalarValue::UInt16(Some(v)) => Some(Value::from(*v as u64)),
-        ScalarValue::UInt32(Some(v)) => Some(Value::from(*v as u64)),
-        ScalarValue::UInt64(Some(v)) => Some(Value::from(*v)),
-        ScalarValue::Float32(Some(v)) => Some(float_to_json(*v as f64)),
-        ScalarValue::Float64(Some(v)) => Some(float_to_json(*v)),
-        ScalarValue::Decimal128(Some(v), _, _) => Some(Value::String(v.to_string())),
-        ScalarValue::TimestampSecond(Some(v), _) => Some(Value::from(*v)),
-        ScalarValue::TimestampMillisecond(Some(v), _) => Some(Value::from(*v)),
-        ScalarValue::TimestampMicrosecond(Some(v), _) => Some(Value::from(*v)),
-        ScalarValue::TimestampNanosecond(Some(v), _) => Some(Value::from(*v)),
-        ScalarValue::Date32(Some(v)) => Some(Value::from(*v as i64)),
-        ScalarValue::Date64(Some(v)) => Some(Value::from(*v)),
-        ScalarValue::Time32Second(Some(v)) => Some(Value::from(*v as i64)),
-        ScalarValue::Time32Millisecond(Some(v)) => Some(Value::from(*v as i64)),
-        ScalarValue::Time64Microsecond(Some(v)) => Some(Value::from(*v)),
-        ScalarValue::Time64Nanosecond(Some(v)) => Some(Value::from(*v)),
-        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
-            Some(Value::String(v.clone()))
-        }
-        ScalarValue::Binary(Some(v)) | ScalarValue::LargeBinary(Some(v)) => {
-            Some(Value::String(BASE64_STANDARD.encode(v)))
-        }
-        ScalarValue::FixedSizeBinary(_, Some(v)) => Some(Value::String(BASE64_STANDARD.encode(v))),
-        ScalarValue::Boolean(Some(v)) => Some(Value::Bool(*v)),
-        _ => None,
-    }
-}
-
 fn to_i64(value: &Value) -> Option<i64> {
     match value {
         Value::Number(n) => n.as_i64().or_else(|| {
@@ -184,24 +141,6 @@ fn parse_f64(value: &Value) -> Option<f64> {
             _ => None,
         },
         _ => None,
-    }
-}
-
-#[allow(dead_code)]
-fn float_to_json(value: f64) -> Value {
-    if value.is_nan() {
-        Value::String("NaN".into())
-    } else if value.is_infinite() {
-        if value.is_sign_positive() {
-            Value::String("Infinity".into())
-        } else {
-            Value::String("-Infinity".into())
-        }
-    } else {
-        // serde_json preserves the sign of -0.0 through Number::from_f64.
-        serde_json::Number::from_f64(value)
-            .map(Value::Number)
-            .unwrap_or_else(|| Value::String(value.to_string()))
     }
 }
 
@@ -259,11 +198,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_int64_round_trip() {
+    fn test_int64_value() {
         let value = Value::from(i64::MIN);
         let scalar = json_to_scalar_value(&value, &DataType::Int64).unwrap();
         assert_eq!(scalar, ScalarValue::Int64(Some(i64::MIN)));
-        assert_eq!(scalar_value_to_json(&scalar).unwrap(), value);
     }
 
     #[test]
@@ -272,7 +210,6 @@ mod tests {
         let value = Value::from(v);
         let scalar = json_to_scalar_value(&value, &DataType::UInt64).unwrap();
         assert_eq!(scalar, ScalarValue::UInt64(Some(v)));
-        assert_eq!(scalar_value_to_json(&scalar).unwrap(), value);
     }
 
     #[test]
@@ -291,7 +228,6 @@ mod tests {
             } else {
                 assert_eq!(actual, expected);
             }
-            assert_eq!(scalar_value_to_json(&scalar).unwrap(), json);
         }
 
         let neg_zero = serde_json::Number::from_f64(-0.0).unwrap();
@@ -302,18 +238,14 @@ mod tests {
         };
         assert_eq!(actual, -0.0);
         assert!(actual.is_sign_negative());
-        assert_eq!(
-            scalar_value_to_json(&scalar).unwrap(),
-            Value::Number(neg_zero)
-        );
     }
 
     #[test]
-    fn test_decimal_round_trip() {
+    fn test_decimal_values() {
         let scalar = ScalarValue::Decimal128(Some(12345), 10, 2);
-        let json = scalar_value_to_json(&scalar).unwrap();
-        assert_eq!(json, Value::String("12345".into()));
-        let back = json_to_scalar_value(&json, &DataType::Decimal128(10, 2)).unwrap();
+        let back =
+            json_to_scalar_value(&Value::String("12345".into()), &DataType::Decimal128(10, 2))
+                .unwrap();
         assert_eq!(back, scalar);
 
         // String form including the decimal point.
@@ -335,7 +267,6 @@ mod tests {
             scalar,
             ScalarValue::TimestampMicrosecond(Some(1_700_000_000_000_000), None)
         );
-        assert_eq!(scalar_value_to_json(&scalar).unwrap(), ts_us);
 
         let ts_ns = Value::from(1_700_000_000_000_000_123i64);
         let scalar =
@@ -347,25 +278,19 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_round_trip() {
+    fn test_binary_value() {
         let bytes = vec![0u8, 1, 2, 255, 254];
         let encoded = BASE64_STANDARD.encode(&bytes);
         let scalar =
             json_to_scalar_value(&Value::String(encoded.clone()), &DataType::Binary).unwrap();
         assert_eq!(scalar, ScalarValue::Binary(Some(bytes.clone())));
-        assert_eq!(
-            scalar_value_to_json(&scalar).unwrap(),
-            Value::String(encoded)
-        );
     }
 
     #[test]
-    fn test_utf8_round_trip() {
-        let scalar = ScalarValue::Utf8(Some("hello \n world".into()));
-        let json = scalar_value_to_json(&scalar).unwrap();
-        assert_eq!(json, Value::String("hello \n world".into()));
-        let back = json_to_scalar_value(&json, &DataType::Utf8).unwrap();
-        assert_eq!(back, scalar);
+    fn test_utf8_value() {
+        let json = Value::String("hello \n world".into());
+        let scalar = json_to_scalar_value(&json, &DataType::Utf8).unwrap();
+        assert_eq!(scalar, ScalarValue::Utf8(Some("hello \n world".into())));
     }
 
     #[test]

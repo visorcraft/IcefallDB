@@ -281,7 +281,11 @@ async fn test_create_unique_index_rejects_duplicates_and_leaves_catalog_clean() 
     };
     let mut writer = Writer::create(storage, "dupes", schema).await.unwrap();
     // Two rows share id=1 → a unique index on `id` must be rejected.
-    let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
     let batch = RecordBatch::try_new(
         arrow_schema,
         vec![Arc::new(Int64Array::from(vec![1, 1, 2]))],

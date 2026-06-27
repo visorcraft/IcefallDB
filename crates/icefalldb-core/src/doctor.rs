@@ -1248,14 +1248,15 @@ pub struct HistoryReport {
 /// Verify the retained manifest hash chain for `table`.
 ///
 /// Each retained manifest is verified against its own stored checksum.
-/// Adjacent manifests (ascending sequence order) are checked for a valid chain
-/// link: `m.parent_hash == Some(prev.checksum)` → linked.
+/// Adjacent retained manifests (ascending sequence order) are checked for a
+/// valid chain link when the current manifest is post-chain:
+/// `m.parent_hash == Some(prev.checksum)` → linked.
 ///
-/// **Anchor rule (corrected):** `m.parent_hash == None` while a predecessor is
-/// present on disk is treated as an *anchor* — valid for genesis manifests,
-/// GC-pruned predecessors, and legacy manifests written before hash-chaining
-/// was introduced.  It is **never** reported as a break.  Only
-/// `Some(other)` where `other != prev.checksum` is a chain break (tampering).
+/// Anchor rule: `parent_hash = None` is valid for the first retained manifest
+/// (genesis or history whose predecessor was GC-pruned) and for legacy
+/// manifests written before `committed_at`/`parent_hash` existed. Once a
+/// timestamped manifest has a retained verified predecessor, a missing or
+/// mismatched `parent_hash` is a chain break.
 ///
 /// A self-checksum mismatch at sequence N is always a break.  When that
 /// happens `prev` is reset to `None` so subsequent manifests are not compared
@@ -1371,8 +1372,16 @@ pub async fn verify_history(storage: &dyn Storage, table: &str) -> Result<Histor
                         reason: "parent_hash mismatch: does not match predecessor checksum".into(),
                     });
                 }
-                // None is an anchor (genesis / GC-pruned / legacy) — not a break.
-                None => {}
+                // No timestamp means this is a pre-chain legacy manifest, where
+                // parent_hash did not exist yet. Keep it as an anchor.
+                None if m.committed_at.is_none() => {}
+                // A post-chain manifest with a retained predecessor must link.
+                None => {
+                    breaks.push(ChainBreak {
+                        sequence: seq,
+                        reason: "missing parent_hash: retained predecessor is present".into(),
+                    });
+                }
             }
         }
 

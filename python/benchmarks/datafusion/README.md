@@ -12,6 +12,8 @@ runs against IcefallDB's own query layer via the existing Python adapter.
 - `run_icefalldb_query_bench.py` — warm-cache 9-query matrix runner.
 - `bench_cold_cache.py` — cold-cache variant; evicts Parquet files from the OS
   page cache with `posix_fadvise(POSIX_FADV_DONTNEED)` before each timed query.
+- `generate_baseline_doc.py` — renders benchmark JSON into a Markdown baseline
+  under `python/benchmarks/datafusion/baselines/` by default.
 - `README.md` — this file.
 
 ## Query matrix

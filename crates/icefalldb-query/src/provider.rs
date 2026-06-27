@@ -498,11 +498,9 @@ impl IcefallDBTableProvider {
     /// per-column keys are fetched from the `KeyProvider` lazily based on the
     /// projected and filtered columns.
     ///
-    /// The AAD prefix is loaded from the stored `_encryption.json` marker
-    /// (rather than recomputed from a hardcoded schema id) so this constructor
-    /// works correctly for tables whose schema has evolved or whose marker
-    /// was written with a custom AAD. Falls back to deriving one from the
-    /// table name + schema id 1 only if the marker is absent or malformed.
+    /// The AAD prefix and plaintext-footer flag are loaded from the stored
+    /// `_encryption.json` marker. The marker pins the table's encryption
+    /// parameters, so it must be present, parseable, and valid.
     #[cfg(feature = "encryption")]
     pub async fn new_encrypted(
         storage: Arc<dyn Storage>,
@@ -2053,14 +2051,13 @@ fn build_native_bulk_decode_plan(
     Ok(plan)
 }
 
-/// Read the encryption marker for a table and return its AAD prefix and
-/// plaintext-footer flag.
+/// Read and validate the encryption marker for a table, returning its AAD
+/// prefix and plaintext-footer flag.
 ///
-/// Returns an empty AAD if the marker is absent or unparseable, in which case
-/// the caller (or the file itself, when `with_aad_prefix_storage(true)` was
-/// used at write time) provides the AAD. A marker that parses cleanly but
-/// advertises an unknown algorithm is rejected (propagated as an error) rather
-/// than silently treated as decryptable.
+/// Encrypted providers fail closed when the marker is missing, malformed, or
+/// carries an invalid AAD. The marker is the source of truth that pins a table's
+/// encryption parameters; silently falling back to empty AAD/plaintext defaults
+/// would weaken that invariant.
 #[cfg(feature = "encryption")]
 async fn read_encryption_marker(
     storage: &Arc<dyn Storage>,
@@ -2070,20 +2067,27 @@ async fn read_encryption_marker(
     use icefalldb_core::encryption::SchemaEncryptionMarker;
 
     let marker_path = format!("{table}/_encryption.json");
-    let bytes = match storage.read(&marker_path).await {
-        Ok(b) => b,
-        Err(_) => return Ok((Vec::new(), true)),
-    };
-    let marker: SchemaEncryptionMarker = match serde_json::from_slice(&bytes) {
-        Ok(m) => m,
-        Err(_) => return Ok((Vec::new(), true)),
-    };
-    // A well-formed marker must advertise a scheme we know how to read.
+    let bytes = storage.read(&marker_path).await.map_err(|e| {
+        QueryError::Core(icefalldb_core::IcefallDBError::Encryption(format!(
+            "encrypted table '{table}' is missing or cannot read _encryption.json: {e}"
+        )))
+    })?;
+    let marker: SchemaEncryptionMarker = serde_json::from_slice(&bytes).map_err(|e| {
+        QueryError::Core(icefalldb_core::IcefallDBError::Encryption(format!(
+            "failed to parse {marker_path}: {e}"
+        )))
+    })?;
     marker.validate()?;
-    let aad = marker
-        .aad_prefix
-        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .unwrap_or_default();
+    let aad = match marker.aad_prefix {
+        Some(b64) => base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| {
+                QueryError::Core(icefalldb_core::IcefallDBError::Encryption(format!(
+                    "invalid AAD prefix base64 in {marker_path}: {e}"
+                )))
+            })?,
+        None => Vec::new(),
+    };
     Ok((aad, marker.plaintext_footer))
 }
 

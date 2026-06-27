@@ -126,11 +126,8 @@ async fn tampered_manifest_is_flagged() {
     );
 }
 
-/// A manifest with `parent_hash: None` while a predecessor is present on disk
-/// must be treated as an anchor (genesis / GC-pruned / legacy), NOT as a break.
-///
-/// This guards the corrected anchor-vs-break logic against regressions: the
-/// original brief draft incorrectly flagged `None` as a break.
+/// A legacy manifest with `parent_hash: None` and no `committed_at` while a
+/// predecessor is present on disk must be treated as an anchor, not as a break.
 #[tokio::test]
 async fn legacy_none_parent_hash_is_anchor_not_break() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
@@ -184,7 +181,7 @@ async fn legacy_none_parent_hash_is_anchor_not_break() {
     let report = verify_history(storage.as_ref(), &table).await.unwrap();
     assert!(
         report.intact,
-        "None parent_hash on m2 with m1 present must be an anchor (not a break): {:?}",
+        "legacy None parent_hash on m2 with m1 present must be an anchor: {:?}",
         report
             .breaks
             .iter()
@@ -195,6 +192,45 @@ async fn legacy_none_parent_hash_is_anchor_not_break() {
         report.breaks.len(),
         0,
         "no breaks expected for legacy None parent_hash"
+    );
+}
+
+/// A post-chain manifest (timestamp present) with `parent_hash: None` while a
+/// verified predecessor is retained is not a valid anchor. It must be reported
+/// as a broken chain link.
+#[tokio::test]
+async fn timestamped_missing_parent_hash_is_flagged() {
+    let (storage, table) = setup_table_with_two_inserts().await;
+
+    let path = format!("{}/{}", table, Manifest::filename(2));
+    let mut m: Manifest = serde_json::from_slice(&storage.read(&path).await.unwrap()).unwrap();
+    assert!(
+        m.committed_at.is_some(),
+        "writer-produced manifest must be post-chain"
+    );
+    m.parent_hash = None;
+    m.checksum = m.compute_checksum().unwrap();
+    storage
+        .write(&path, &serde_json::to_vec(&m).unwrap())
+        .await
+        .unwrap();
+
+    let report = verify_history(storage.as_ref(), &table).await.unwrap();
+    assert!(
+        !report.intact,
+        "timestamped manifest missing parent_hash must break the chain"
+    );
+    assert!(
+        report
+            .breaks
+            .iter()
+            .any(|b| b.sequence == 2 && b.reason.contains("missing parent_hash")),
+        "break must name the missing parent_hash on seq 2; got: {:?}",
+        report
+            .breaks
+            .iter()
+            .map(|b| format!("seq={}: {}", b.sequence, b.reason))
+            .collect::<Vec<_>>()
     );
 }
 

@@ -293,8 +293,8 @@ pub async fn locate_matches(
     // the in-memory secondary index + row-id segments, with no DataFusion plan
     // or scan. This is the dominant cost for point DELETEs on a UNIQUE-indexed
     // column (a full scan otherwise).
-    // ponytail: any miss OR error falls back to the proven scan path below — the
-    // fast path is a pure accelerator and must never be why a DELETE breaks.
+    // Any miss or error falls back to the scan path below; the fast path is a
+    // pure accelerator and must never be why a DELETE breaks.
     if let Ok(provider) = ctx.table_provider(table).await {
         if let Some(p) =
             (provider.as_ref() as &dyn std::any::Any).downcast_ref::<IcefallDBTableProvider>()

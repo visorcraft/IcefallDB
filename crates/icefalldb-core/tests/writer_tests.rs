@@ -7,9 +7,11 @@ use icefalldb_core::storage::memory::MemoryStorage;
 use icefalldb_core::storage::{LockGuard, Storage};
 use icefalldb_core::writer::{InsertParquetOutcome, Writer};
 use icefalldb_core::Result;
-use icefalldb_core::{build_btree_index, DatabaseCatalog, IndexDefinition};
+use icefalldb_core::{
+    build_btree_index, load_index_by_ref, segment_ids, DatabaseCatalog, IndexDefinition,
+};
 use parquet::arrow::ArrowWriter;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1064,9 +1066,11 @@ async fn test_insert_duplicate_parquet_reuses_data_file() {
     let manifest = read_latest_manifest(&storage, "products").await;
     assert_eq!(manifest.row_groups.len(), 2);
     assert_eq!(manifest.row_groups[0].data, manifest.row_groups[1].data);
+    assert_eq!(manifest.next_row_id, 200);
 
     // Logical table rows reflect both inserts; physical storage is not doubled.
     let mut total_rows = 0usize;
+    let mut all_row_ids = Vec::new();
     for entry in &manifest.row_groups {
         let meta: RowGroupMeta = serde_json::from_slice(
             &storage
@@ -1076,8 +1080,86 @@ async fn test_insert_duplicate_parquet_reuses_data_file() {
         )
         .unwrap();
         total_rows += meta.rows;
+        all_row_ids.extend(meta.row_ids.iter().flat_map(segment_ids));
     }
     assert_eq!(total_rows, 200);
+    assert_eq!(all_row_ids.len(), 200);
+    let unique_row_ids: HashSet<_> = all_row_ids.iter().copied().collect();
+    assert_eq!(
+        unique_row_ids.len(),
+        200,
+        "dedup append must allocate fresh stable row IDs"
+    );
+}
+
+#[tokio::test]
+async fn test_duplicate_parquet_updates_non_unique_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let schema = make_schema(1_000_000);
+
+    let parquet_path = dir.path().join("input.parquet");
+    let ids: Vec<i64> = (0..100).collect();
+    make_parquet_file(&parquet_path, &ids);
+
+    let mut writer = Writer::create(Arc::clone(&storage), "products", schema.clone())
+        .await
+        .unwrap();
+    writer
+        .insert_parquet(parquet_path.to_str().unwrap())
+        .await
+        .unwrap();
+
+    let catalog = DatabaseCatalog::new(Arc::clone(&storage));
+    let lock = catalog.acquire_lock(Duration::from_secs(30)).await.unwrap();
+    let manifest = read_latest_manifest(&storage, "products").await;
+    let definition = IndexDefinition {
+        name: "products_id_idx".into(),
+        table: "products".into(),
+        column: "id".into(),
+        unique: false,
+    };
+    let index = build_btree_index(storage.as_ref(), &definition, &manifest)
+        .await
+        .unwrap();
+    catalog
+        .create_index_definition_with_options(
+            &lock,
+            "products_id_idx",
+            "products",
+            "id",
+            "btree",
+            false,
+        )
+        .await
+        .unwrap();
+    index.save(storage.as_ref()).await.unwrap();
+    drop(lock);
+
+    let mut writer = Writer::new(Arc::clone(&storage), "products", schema.clone())
+        .await
+        .unwrap();
+    writer
+        .insert_parquet(parquet_path.to_str().unwrap())
+        .await
+        .unwrap();
+
+    let manifest = read_latest_manifest(&storage, "products").await;
+    let index_ref = manifest
+        .index_generations
+        .get("products_id_idx")
+        .expect("dedup commit should record a fresh index generation");
+    let index = load_index_by_ref(storage.as_ref(), "products", "products_id_idx", index_ref)
+        .await
+        .unwrap()
+        .expect("index generation should load");
+    let hits = index.lookup("42");
+    assert_eq!(
+        hits.len(),
+        2,
+        "non-unique index must include both logical copies of a deduped file"
+    );
+    assert_ne!(hits[0], hits[1]);
 }
 
 /// Regression test for M01: content-addressed dedup must not bypass a UNIQUE

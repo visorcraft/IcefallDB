@@ -130,7 +130,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=Path,
-        default=REPO / "docs" / "superpowers" / "baselines",
+        default=REPO / "python" / "benchmarks" / "datafusion" / "baselines",
     )
     args = parser.parse_args()
 

@@ -92,9 +92,8 @@ fn latest_manifest_sequence(db: &Path, table: &str) -> u64 {
 /// Two concurrent `icefalldb insert` processes into the same table with disjoint
 /// integer keys must not lose rows and must advance the manifest sequence.
 ///
-/// This is the cross-process stress test required by PLAN.md Issue C01: the
-/// `_write.lock` must serialize commits so the two processes observe a consistent
-/// manifest and the final table contains the union of both batches.
+/// The `_write.lock` must serialize commits so the two processes observe a
+/// consistent manifest and the final table contains the union of both batches.
 #[tokio::test]
 async fn test_cross_process_insert_disjoint_keys() {
     let tmp = tempfile::tempdir().unwrap();
