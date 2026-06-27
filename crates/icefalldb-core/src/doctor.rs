@@ -517,12 +517,13 @@ impl<'a> Doctor<'a> {
             return Ok(());
         }
 
-        let Some(schema) = self.load_schema(manifest.schema_id).await? else {
-            return Ok(());
-        };
+        let schema = self.load_schema(manifest.schema_id).await?;
 
         #[cfg(feature = "encryption")]
-        let encrypted_columns = self.read_encrypted_columns(&schema).await?;
+        let encrypted_columns = match &schema {
+            Some(schema) => self.read_encrypted_columns(schema).await?,
+            None => HashSet::new(),
+        };
         #[cfg(not(feature = "encryption"))]
         let encrypted_columns: HashSet<String> = HashSet::new();
 
@@ -532,6 +533,22 @@ impl<'a> Doctor<'a> {
             if self.exists_resolving_not_found(&meta_path).await? {
                 continue;
             }
+
+            // Without the schema we cannot interpret the Parquet footer to
+            // regenerate a row-group meta sidecar. Report every missing sidecar
+            // as unrepairable instead of failing silently.
+            let Some(schema) = &schema else {
+                actions.push(RepairAction {
+                    kind: ActionKind::Unrepairable,
+                    path: entry.meta.clone(),
+                    detail: format!(
+                        "row group meta {} is missing and schema {} is also missing",
+                        entry.meta,
+                        Schema::filename(manifest.schema_id)
+                    ),
+                });
+                continue;
+            };
 
             let data_path = format!("{}/{}", self.table, entry.data);
             let parquet_bytes = match self.storage.read(&data_path).await {
@@ -575,7 +592,7 @@ impl<'a> Doctor<'a> {
             match crate::writer::compute_row_group_meta_from_footer(
                 rg_id,
                 manifest.schema_id,
-                &schema,
+                schema,
                 &parquet_bytes,
                 &metadata,
                 &encrypted_columns,

@@ -779,3 +779,33 @@ async fn test_doctor_diagnose_reports_missing_row_group_meta() {
         .iter()
         .any(|i| i.kind == DiagnosisKind::MissingRowGroupMeta));
 }
+
+#[tokio::test]
+async fn test_doctor_repair_missing_schema_is_unrepairable() {
+    let (storage, table) = setup_committed_table().await;
+    let manifest = read_latest_manifest(storage.as_ref(), &table).await;
+    let schema_path = format!("{}/{}", table, Schema::filename(manifest.schema_id));
+    let meta_path = format!("{}/{}", table, manifest.row_groups[0].meta);
+
+    // Delete the schema file (but leave the schema pointer so repair proceeds
+    // past the existence check). `load_schema` will now return None.
+    storage.delete(&schema_path).await.unwrap();
+    // Also delete the meta sidecar so there is something to repair.
+    storage.delete(&meta_path).await.unwrap();
+
+    let doctor = Doctor::new(storage.as_ref(), &table);
+    let result = doctor.repair().await.unwrap();
+
+    assert!(
+        !result.healthy,
+        "repair should be non-healthy when the schema is missing"
+    );
+    assert!(
+        result
+            .actions
+            .iter()
+            .any(|a| a.kind == ActionKind::Unrepairable && a.path == manifest.row_groups[0].meta),
+        "expected Unrepairable action for missing meta when schema is missing: {:?}",
+        result.actions
+    );
+}
