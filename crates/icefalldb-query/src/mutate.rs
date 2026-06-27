@@ -32,6 +32,7 @@ use icefalldb_core::storage::Storage;
 use icefalldb_core::{CommitDelta, MatchLoc, Writer};
 
 use crate::{IcefallDBTableProvider, QueryError, Result};
+use icefalldb_core::IcefallDBError;
 
 // ── Source dedup + cardinality check ───────────────────────────────────
 
@@ -726,7 +727,7 @@ async fn execute_merge_to_delta(
     use icefalldb_core::catalog::Catalog;
 
     // ── Step 1: verify a unique index on `key` exists ───────────────────────
-    require_unique_key_index(Arc::clone(&storage), table, key).await?;
+    let unique_index_name = require_unique_key_index(Arc::clone(&storage), table, key).await?;
 
     // ── Step 2: dedup source (Error on duplicates — SQL-standard) ───────────
     let deduped = dedup_source(&src, key, DupPolicy::Error)?;
@@ -840,9 +841,11 @@ async fn execute_merge_to_delta(
                 // A second live entry means the contract is already broken; refuse the
                 // MERGE rather than silently masking the corruption.
                 if live_map.contains_key(&key_sv) {
-                    return Err(QueryError::Other(format!(
-                        "unique key violation on table '{table}': key {key_sv} has more than one live target row"
-                    )));
+                    return Err(QueryError::Core(IcefallDBError::UniqueKeyViolation {
+                        table: table.to_string(),
+                        index: unique_index_name.clone(),
+                        key: key_sv.to_string(),
+                    }));
                 }
                 live_map.insert(key_sv, loc);
             }
@@ -4231,6 +4234,93 @@ mod tests {
             scalar_i64(&ctx, "SELECT v FROM t_merge_dup_src WHERE id = 7").await,
             70,
             "row id=7 must be unchanged"
+        );
+    }
+
+    /// A duplicate LIVE target row for a single merge key must surface as the
+    /// structured `IcefallDBError::UniqueKeyViolation` variant, not a plain
+    /// `QueryError::Other` string.
+    #[tokio::test]
+    async fn merge_duplicate_live_target_returns_structured_unique_key_violation() {
+        use icefalldb_core::database_catalog::DatabaseCatalog;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()).unwrap());
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let mut mdb_schema = arrow_schema_to_icefalldb(Arc::clone(&arrow_schema));
+        mdb_schema.row_group_target_rows = 5;
+
+        // Write duplicate live rows for id=7 without a unique index.
+        let mut writer = Writer::create(Arc::clone(&storage), "t", mdb_schema)
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![7i64, 7])),
+                Arc::new(Int64Array::from(vec![70i64, 700])),
+            ],
+        )
+        .unwrap();
+        writer.insert_batch(batch).await.unwrap();
+        writer.commit().await.unwrap();
+
+        // Register a UNIQUE index definition (but do not build the index file),
+        // so MERGE sees the unique-index contract while the data still contains
+        // duplicate live target rows.
+        let catalog = DatabaseCatalog::new(Arc::clone(&storage));
+        let guard = catalog.acquire_lock(Duration::from_secs(5)).await.unwrap();
+        catalog
+            .create_index_definition_with_options(
+                &guard, "id_uniq", "t", "id", "btree", true, // unique
+            )
+            .await
+            .unwrap();
+        drop(guard);
+
+        let provider = Arc::new(
+            IcefallDBTableProvider::new(Arc::clone(&storage), "t", mutate_provider_config())
+                .await
+                .unwrap(),
+        );
+        let ctx = icefalldb_session(1, 1024);
+        ctx.register_table("t", provider).unwrap();
+
+        let src = make_merge_src(7, 999);
+        let err = execute_merge(
+            &ctx,
+            Arc::clone(&storage),
+            "t",
+            "t",
+            "id",
+            src,
+            MatchedAction::UpdateAll,
+            NotMatchedAction::Insert,
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            QueryError::Core(IcefallDBError::UniqueKeyViolation { table, index, key }) => {
+                assert_eq!(table, "t", "violation must name the target table");
+                assert_eq!(index, "id_uniq", "violation must name the unique index");
+                assert_eq!(key, "7", "violation must include the duplicate key value");
+            }
+            other => {
+                panic!("expected UniqueKeyViolation variant, got {other:?} (message: {other})")
+            }
+        }
+
+        // The table must be left untouched.
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT COUNT(*) FROM t").await,
+            2,
+            "duplicate-live-target MERGE must not modify the table"
         );
     }
 
