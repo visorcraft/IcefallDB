@@ -1022,11 +1022,19 @@ pub struct SnapshotInfo {
     /// Live rows (physical rows minus `deleted_count`). For the current
     /// checkpoint snapshot this folds any pending mutation WAL so it matches the
     /// live query count; older snapshots reflect their committed deletion state.
+    ///
+    /// **WAL-folded caveat:** the folded live-row count is accurate when the
+    /// pending WAL records are DELETE-only. UPDATE/MERGE WAL records may append
+    /// new fragments that are not reflected in the checkpoint's physical row
+    /// count, causing the displayed count to undercount until the next checkpoint.
     pub rows: u64,
     pub fragments: usize,
     pub parent_hash: Option<String>,
     /// `true` when the row count was computed by folding pending WAL records
     /// into the current checkpoint snapshot.
+    ///
+    /// When `true`, [`SnapshotInfo::rows`] is DELETE-only exact; UPDATE/MERGE
+    /// WAL records may undercount live rows until the next checkpoint.
     pub wal_folded: bool,
 }
 
@@ -1116,6 +1124,11 @@ async fn read_pointer_sequence(storage: &dyn Storage, table: &str) -> Option<u64
 /// Row counts are *live* counts: physical rows minus `deleted_count`. For the
 /// current checkpoint snapshot, any pending mutation WAL records are folded so
 /// the displayed count matches the live query count.
+///
+/// The WAL-folded count is exact for DELETE-only WAL records. UPDATE/MERGE WAL
+/// records may append new fragments that are not included in the checkpoint's
+/// physical row count, so the displayed count may undercount until the next
+/// checkpoint.
 pub async fn list_snapshots(storage: &dyn Storage, table: &str) -> Result<Vec<SnapshotInfo>> {
     let manifests_dir = format!("{}/_manifests", table);
     let entries = match storage.list(&manifests_dir).await {

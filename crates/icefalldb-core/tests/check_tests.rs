@@ -1,7 +1,7 @@
 use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use icefalldb_core::check::{CheckResult, Severity};
-use icefalldb_core::metadata::{Column, Manifest, RowGroupMeta, Schema};
+use icefalldb_core::metadata::{Column, Manifest, RowGroupEntry, RowGroupMeta, Schema};
 use icefalldb_core::storage::local::LocalStorage;
 use icefalldb_core::storage::Storage;
 use icefalldb_core::writer::{compute_row_group_meta, Writer};
@@ -1254,6 +1254,119 @@ async fn test_check_utf8_to_large_utf8_promotion_accepted() {
     let checker = icefalldb_core::Checker::new(&storage, "products");
     let result = checker.check().await.unwrap();
     assert!(result.passed, "issues: {:?}", result.issues);
+}
+
+/// Legacy manifests with an empty `checksum` field must still protect their
+/// referenced row-group files from orphan warnings. Regression test for M06.
+#[tokio::test]
+async fn test_check_legacy_manifests_protect_referenced_row_groups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = LocalStorage::new(tmp.path()).unwrap();
+
+    // Create a current snapshot with one valid row group.
+    let schema = make_schema();
+    let mut writer = Writer::new(Arc::new(storage.clone()), "products", schema.clone())
+        .await
+        .unwrap();
+    writer
+        .insert_batch(make_batch(vec![1, 2, 3]))
+        .await
+        .unwrap();
+    writer.commit().await.unwrap();
+
+    // Two additional row-group files referenced only by legacy manifests.
+    storage
+        .write("products/rg_legacy1.parquet", b"legacy-data-1")
+        .await
+        .unwrap();
+    storage
+        .write("products/rg_legacy1.meta", b"legacy-meta-1")
+        .await
+        .unwrap();
+    storage
+        .write("products/rg_legacy2.parquet", b"legacy-data-2")
+        .await
+        .unwrap();
+    storage
+        .write("products/rg_legacy2.meta", b"legacy-meta-2")
+        .await
+        .unwrap();
+
+    // Two legacy manifests with empty checksums referencing the legacy row groups.
+    for (seq, data, meta) in [
+        (2u64, "rg_legacy1.parquet", "rg_legacy1.meta"),
+        (3u64, "rg_legacy2.parquet", "rg_legacy2.meta"),
+    ] {
+        let legacy = Manifest {
+            format_version: 1,
+            sequence: seq,
+            schema_id: 1,
+            row_groups: vec![RowGroupEntry {
+                data: data.into(),
+                meta: meta.into(),
+                ..Default::default()
+            }],
+            checksum: String::new(),
+            ..Default::default()
+        };
+        storage
+            .write(
+                &format!("products/{}", Manifest::filename(seq)),
+                &serde_json::to_vec_pretty(&legacy).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Current manifest at sequence 4 with a valid checksum, pointing to the
+    // original row group. It does not reference the legacy row groups.
+    let current_manifest = {
+        let data = storage.read("products/_manifest.json").await.unwrap();
+        let pointer: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        let seq = pointer["latest"].as_u64().unwrap();
+        let mut m: Manifest = serde_json::from_slice(
+            &storage
+                .read(&format!("products/{}", Manifest::filename(seq)))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        m.sequence = 4;
+        m.checksum = m.compute_checksum().unwrap();
+        m
+    };
+    storage
+        .write(
+            &format!("products/{}", Manifest::filename(4)),
+            &serde_json::to_vec_pretty(&current_manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+    storage
+        .write(
+            "products/_manifest.json",
+            &serde_json::to_vec_pretty(&serde_json::json!({ "latest": 4 })).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let checker = icefalldb_core::Checker::new(&storage, "products");
+    let result = checker.check().await.unwrap();
+    assert!(
+        result.passed,
+        "check must pass, got issues: {:?}",
+        result.issues
+    );
+    let orphan_warnings: Vec<_> = result
+        .issues
+        .iter()
+        .filter(|i| i.code == "UNREFERENCED_ROW_GROUP")
+        .collect();
+    assert!(
+        orphan_warnings.is_empty(),
+        "check emitted orphan warnings for files referenced by legacy manifests: {:?}",
+        orphan_warnings
+    );
 }
 
 /// After optimize retains older snapshots, `check` must not warn that files

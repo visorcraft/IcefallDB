@@ -819,6 +819,10 @@ pub fn referenced_files<'a>(manifests: impl Iterator<Item = &'a Manifest>) -> Ha
 /// skipped. Other I/O errors are propagated. Invalid snapshots (bad JSON,
 /// sequence mismatch, unsupported format version, or checksum failure) are
 /// ignored so callers can treat the retained valid set as authoritative.
+///
+/// **Legacy exception:** manifests with an empty `checksum` field are treated as
+/// pre-checksum snapshots and are included. This protects row-group files
+/// referenced only by older legacy snapshots from being flagged as orphans.
 pub async fn retained_valid_manifests(
     storage: &dyn Storage,
     table: &str,
@@ -849,7 +853,6 @@ pub async fn retained_valid_manifests(
         let data = match storage.read(&entry).await {
             Ok(d) => d,
             Err(e) if is_not_found(&e) => continue,
-            Err(IcefallDBError::Io(e)) => return Err(IcefallDBError::Io(e)),
             Err(e) => return Err(e),
         };
 
@@ -865,6 +868,7 @@ pub async fn retained_valid_manifests(
         }
         match manifest.verify_checksum() {
             Ok(true) => {}
+            Ok(false) if manifest.checksum.is_empty() => {} // legacy: no checksum
             Ok(false) | Err(_) => continue,
         }
         valid.insert(seq, manifest);
@@ -979,8 +983,15 @@ pub async fn verify_history(storage: &dyn Storage, table: &str) -> Result<Histor
         // Self-checksum gate: a mismatch means the file was tampered or
         // corrupted.  We cannot trust m.checksum for the chain link, so
         // reset prev and skip the parent check for this entry.
+        //
+        // An empty `checksum` field marks a pre-checksum (legacy) manifest;
+        // treat it like an anchor rather than a break.
         match m.verify_checksum() {
             Ok(true) => {}
+            Ok(false) if m.checksum.is_empty() => {
+                prev = None;
+                continue;
+            }
             Ok(false) => {
                 breaks.push(ChainBreak {
                     sequence: seq,
