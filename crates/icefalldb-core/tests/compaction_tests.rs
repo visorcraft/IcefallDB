@@ -786,7 +786,7 @@ async fn test_compaction_intent_rollback() {
 }
 
 #[tokio::test]
-async fn test_compaction_fails_when_manifest_pointer_missing() {
+async fn test_compaction_repairs_missing_pointer() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let schema = make_int_schema(100);
     let mut writer = Writer::new(Arc::clone(&storage), "products", schema)
@@ -798,16 +798,32 @@ async fn test_compaction_fails_when_manifest_pointer_missing() {
         .await
         .unwrap();
     writer.commit().await.unwrap();
+    writer
+        .insert_batch(make_batch((11..=20).collect()))
+        .await
+        .unwrap();
+    writer.commit().await.unwrap();
 
-    // Delete the manifest pointer but leave the snapshots intact.
+    let before_seq = read_latest_manifest(&storage, "products").await.sequence;
+
+    // Delete the manifest pointer but leave the snapshots intact. The table
+    // still exists (schema + `_manifests/` snapshots), so compaction must
+    // self-repair the pointer from the retained snapshots rather than reporting
+    // the table as missing. This mirrors `test_compaction_repairs_corrupt_pointer`
+    // for the missing-file (not corrupt-file) case.
     storage.delete("products/_manifest.json").await.unwrap();
 
-    let err = Compactor::new(storage.as_ref(), "products")
+    let result = Compactor::new(storage.as_ref(), "products")
         .compact()
         .await
-        .unwrap_err();
+        .unwrap();
+    assert_eq!(result.input_row_groups, 2);
+    assert_eq!(result.output_row_groups, 1);
 
-    assert!(matches!(err, IcefallDBError::TableNotFound(_)), "{err}");
+    // The pointer must be restored and point to a new compacted snapshot.
+    let pointer_data = storage.read("products/_manifest.json").await.unwrap();
+    let pointer: serde_json::Value = serde_json::from_slice(&pointer_data).unwrap();
+    assert!(pointer["latest"].as_u64().unwrap() > before_seq);
 }
 
 #[tokio::test]

@@ -230,33 +230,57 @@ impl EncryptionKeyResolver {
         &self,
         needed_columns: &std::collections::HashSet<String>,
     ) -> Result<Arc<parquet::encryption::decrypt::FileDecryptionProperties>> {
-        let needs_any_encrypted_column = needed_columns
-            .iter()
-            .any(|name| self.column_key_ids.contains_key(name));
+        // Does this query need a key beyond plaintext columns?
+        //
+        // - Per-column encryption (`column_key_ids` non-empty): only the listed
+        //   encrypted columns require a key; plaintext columns (and `COUNT(*)`,
+        //   which needs no column) do not.
+        // - Uniform / whole-table encryption (`column_key_ids` empty): the footer
+        //   key encrypts every data column, so any query touching a real column
+        //   needs it. Without this, a uniform table read of a data column with a
+        //   missing footer key wrongly took the no-key dummy path and failed with
+        //   an opaque Parquet error instead of a clear missing-key error.
+        //   (`COUNT(*)` — an empty needed set — is still answered from the
+        //   plaintext-footer metadata without a key, matching prior behavior.)
+        let needs_any_encrypted_column = if self.column_key_ids.is_empty() {
+            !needed_columns.is_empty()
+        } else {
+            needed_columns
+                .iter()
+                .any(|name| self.column_key_ids.contains_key(name))
+        };
 
-        // Track whether we are taking the "no footer key needed" dummy path,
-        // rather than inferring it from the key bytes. A caller could legitimately
-        // configure a footer key of 16 zero bytes, and that real key must still
-        // verify the footer signature.
-        let mut disable_footer_verification = false;
-        let footer = match self.provider.get(&self.footer_key_id, &self.aad).await {
+        // Footer key. When the table has a plaintext footer and no encrypted
+        // column is needed, a missing footer key is non-fatal: use a dummy key
+        // and skip signature verification. This branch is detected from the
+        // not-found error (not the key bytes), so a real all-zero footer key
+        // still verifies its signature. No secret material is involved here.
+        let footer_bytes = match self.provider.get(&self.footer_key_id, &self.aad).await {
             Ok(footer) => footer.as_slice().to_vec(),
             Err(e) => {
                 let is_key_not_found =
                     matches!(e, icefalldb_core::IcefallDBError::EncryptionKeyNotFound(_));
                 if self.plaintext_footer && !needs_any_encrypted_column && is_key_not_found {
-                    // No decryption is actually required for this query; use a
-                    // dummy footer key and disable signature verification so the
-                    // read can proceed without the footer key.
-                    disable_footer_verification = true;
-                    vec![0u8; 16]
-                } else {
-                    return Err(map_enc_err(e));
+                    let mut builder =
+                        parquet::encryption::decrypt::FileDecryptionProperties::builder(vec![
+                            0u8;
+                            16
+                        ])
+                        .disable_footer_signature_verification();
+                    if !self.aad.is_empty() {
+                        builder = builder.with_aad_prefix(self.aad.clone());
+                    }
+                    return builder.build().map_err(|e| {
+                        map_enc_err(icefalldb_core::IcefallDBError::Encryption(e.to_string()))
+                    });
                 }
+                return Err(map_enc_err(e));
             }
         };
 
-        let mut column_keys = std::collections::BTreeMap::new();
+        // Resolve only the per-column keys actually needed by this query.
+        let mut column_keys: std::collections::BTreeMap<String, Vec<u8>> =
+            std::collections::BTreeMap::new();
         for name in needed_columns {
             if let Some(kid) = self.column_key_ids.get(name) {
                 let key = self
@@ -268,19 +292,12 @@ impl EncryptionKeyResolver {
             }
         }
 
-        let mut builder = parquet::encryption::decrypt::FileDecryptionProperties::builder(footer);
-        if !self.aad.is_empty() {
-            builder = builder.with_aad_prefix(self.aad.clone());
-        }
-        for (name, key) in column_keys {
-            builder = builder.with_column_key(&name, key);
-        }
-        if disable_footer_verification {
-            builder = builder.disable_footer_signature_verification();
-        }
-        builder
-            .build()
-            .map_err(|e| map_enc_err(icefalldb_core::IcefallDBError::Encryption(e.to_string())))
+        // Build through `EncryptionKeySet` so all key material is held in
+        // `Zeroizing` buffers (wiped on drop) and the shared builder is reused,
+        // restoring the project-wide invariant the bespoke builder bypassed.
+        let key_set = EncryptionKeySet::with_columns(footer_bytes, column_keys, self.aad.clone())
+            .map_err(map_enc_err)?;
+        build_decryption_properties(&key_set).map_err(map_enc_err)
     }
 }
 

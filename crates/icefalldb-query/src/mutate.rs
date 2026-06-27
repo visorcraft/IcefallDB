@@ -1375,7 +1375,29 @@ async fn build_matched_batch_with_assignments(
         )));
     }
 
-    let data_arrays: Vec<ArrayRef> = (0..n_data).map(|i| Arc::clone(result.column(i))).collect();
+    // A bare `NULL` (or any all-NULL expression) is projected by DataFusion as a
+    // `DataType::Null` column, which would not match the target field's concrete
+    // type in `try_new`. Cast such columns to the target type so `SET col = NULL`
+    // works in MERGE exactly as it does in UPDATE (M02). A NULL assigned to a
+    // non-nullable column is rejected here, before any write — `commit_merge`
+    // does not re-check nullability.
+    let data_arrays: Vec<ArrayRef> = (0..n_data)
+        .map(|i| {
+            let col = result.column(i);
+            let target_field = &target_data_fields[i];
+            if col.data_type() == &DataType::Null && target_field.data_type() != &DataType::Null {
+                if !target_field.is_nullable() {
+                    return Err(QueryError::Other(format!(
+                        "MERGE UPDATE SET assigns NULL to non-nullable column '{}'",
+                        target_field.name()
+                    )));
+                }
+                arrow::compute::cast(col, target_field.data_type()).map_err(QueryError::Arrow)
+            } else {
+                Ok(Arc::clone(col))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(target_data_schema, data_arrays).map_err(QueryError::Arrow)
 }
 
@@ -4728,6 +4750,107 @@ mod tests {
             scalar_i64(&ctx, "SELECT COUNT(*) FROM t_e2e_merge").await,
             6,
             "total row count must be 6 after merge (5 original + 1 inserted)"
+        );
+    }
+
+    /// Regression test for the MERGE side of M02: `WHEN MATCHED THEN UPDATE SET
+    /// <nullable> = NULL` must clear the column (just like UPDATE), and a NULL
+    /// assigned to a non-nullable column must be rejected before any write.
+    #[tokio::test]
+    async fn merge_update_set_null() {
+        use icefalldb_core::database_catalog::DatabaseCatalog;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()).unwrap());
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("score", DataType::Int64, true), // nullable
+            Field::new("tag", DataType::Int64, false),  // non-nullable
+        ]));
+        let mut mdb_schema = arrow_schema_to_icefalldb(Arc::clone(&arrow_schema));
+        mdb_schema.row_group_target_rows = 16;
+
+        let dbcat = DatabaseCatalog::new(Arc::clone(&storage));
+        let guard = dbcat.acquire_lock(Duration::from_secs(5)).await.unwrap();
+        dbcat
+            .create_index_definition_with_options(
+                &guard,
+                "id_uniq",
+                "t_merge_null",
+                "id",
+                "btree",
+                true,
+            )
+            .await
+            .unwrap();
+        drop(guard);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![0i64, 1, 2])),
+                Arc::new(Int64Array::from(vec![100i64, 200, 300])),
+                Arc::new(Int64Array::from(vec![7i64, 8, 9])),
+            ],
+        )
+        .unwrap();
+        let mut writer = Writer::create(Arc::clone(&storage), "t_merge_null", mdb_schema)
+            .await
+            .unwrap();
+        writer.insert_batch(batch).await.unwrap();
+        writer.commit().await.unwrap();
+
+        let config = mutate_provider_config();
+        let provider = Arc::new(
+            IcefallDBTableProvider::new(Arc::clone(&storage), "t_merge_null", config)
+                .await
+                .unwrap(),
+        );
+        let ctx = icefalldb_session(1, 1024);
+        ctx.register_table("t_merge_null", provider).unwrap();
+        let root = "t_merge_null".to_string();
+
+        // Success: clear `score` on matched row id=1 (NOT MATCHED never fires).
+        let merge_ok = "MERGE INTO t_merge_null USING (VALUES (1, 999, 9)) AS src(id, score, tag) \
+             ON t_merge_null.id = src.id \
+             WHEN MATCHED THEN UPDATE SET score = NULL \
+             WHEN NOT MATCHED THEN INSERT (id, score, tag) VALUES (src.id, src.score, src.tag)";
+        execute_sql(&ctx, Arc::clone(&storage), &root, merge_ok)
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar_i64(
+                &ctx,
+                "SELECT COUNT(*) FROM t_merge_null WHERE id = 1 AND score IS NULL"
+            )
+            .await,
+            1,
+            "MERGE SET score = NULL must clear the column"
+        );
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT score FROM t_merge_null WHERE id = 0").await,
+            100,
+            "non-matched rows must be untouched"
+        );
+
+        // Rejection: NULL into non-nullable `tag`, table unchanged.
+        let merge_bad =
+            "MERGE INTO t_merge_null USING (VALUES (2, 888, 8)) AS src(id, score, tag) \
+             ON t_merge_null.id = src.id \
+             WHEN MATCHED THEN UPDATE SET tag = NULL \
+             WHEN NOT MATCHED THEN INSERT (id, score, tag) VALUES (src.id, src.score, src.tag)";
+        let err = execute_sql(&ctx, Arc::clone(&storage), &root, merge_bad)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("non-nullable column 'tag'"),
+            "expected non-nullable rejection, got: {err}"
+        );
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT tag FROM t_merge_null WHERE id = 2").await,
+            9,
+            "rejected MERGE must leave the table unchanged"
         );
     }
 

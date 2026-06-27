@@ -1,4 +1,4 @@
-use crate::metadata::{Manifest, Schema};
+use crate::metadata::{Manifest, Schema, SnapshotCheckpoint};
 use crate::storage::Storage;
 use crate::{is_not_found, IcefallDBError, Result};
 use bytes::Bytes;
@@ -531,8 +531,15 @@ impl<'a> Doctor<'a> {
         #[cfg(not(feature = "encryption"))]
         let encrypted_columns: HashSet<String> = HashSet::new();
 
+        // Row-id segments cannot be recovered from the Parquet footer, but the
+        // snapshot checkpoint's fragment summaries retain them. Load it so a
+        // regenerated `.meta` keeps its row ids (the canonical `.meta` is the
+        // source of truth; dropping them would break mutations and let a later
+        // checkpoint rebuild lose them permanently).
+        let checkpoint = self.load_checkpoint(manifest).await;
+
         let mut any_regenerated = false;
-        for entry in &manifest.row_groups {
+        for (idx, entry) in manifest.row_groups.iter().enumerate() {
             let meta_path = format!("{}/{}", self.table, entry.meta);
             if self.exists_resolving_not_found(&meta_path).await? {
                 continue;
@@ -593,6 +600,15 @@ impl<'a> Doctor<'a> {
                 }
             };
 
+            // Recover row-id segments for this fragment from the checkpoint
+            // summary (matched by position, validated by data path + fragment id).
+            let recovered_row_ids = checkpoint
+                .as_ref()
+                .and_then(|cp| cp.fragments.get(idx))
+                .filter(|s| s.data == entry.data && s.fragment_id == entry.fragment_id)
+                .map(|s| s.row_ids.as_slice())
+                .unwrap_or(&[]);
+
             match crate::writer::compute_row_group_meta_from_footer(
                 rg_id,
                 manifest.schema_id,
@@ -600,6 +616,7 @@ impl<'a> Doctor<'a> {
                 &parquet_bytes,
                 &metadata,
                 &encrypted_columns,
+                recovered_row_ids,
             ) {
                 Ok(meta) => {
                     self.storage
@@ -631,6 +648,31 @@ impl<'a> Doctor<'a> {
         }
 
         Ok(())
+    }
+
+    /// Load the snapshot checkpoint for `manifest`, if present. Prefers the
+    /// canonical JSON and falls back to the derived rkyv archive. Returns `None`
+    /// when no checkpoint is referenced or it cannot be read/parsed (the caller
+    /// then treats row ids as unrecoverable).
+    async fn load_checkpoint(&self, manifest: &Manifest) -> Option<SnapshotCheckpoint> {
+        if let Some(rel) = manifest.checkpoint.as_ref() {
+            let abs = format!("{}/{}", self.table, rel);
+            if let Ok(bytes) = self.storage.read(&abs).await {
+                if let Ok(cp) = serde_json::from_slice::<SnapshotCheckpoint>(&bytes) {
+                    return Some(cp);
+                }
+            }
+        }
+        let arch = format!(
+            "{}/{}",
+            self.table,
+            SnapshotCheckpoint::archive_filename(manifest.sequence)
+        );
+        self.storage
+            .read(&arch)
+            .await
+            .ok()
+            .and_then(|b| SnapshotCheckpoint::from_archive_bytes(&b))
     }
 
     async fn load_schema(&self, schema_id: u64) -> Result<Option<Schema>> {

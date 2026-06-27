@@ -201,3 +201,51 @@ async fn snapshots_shows_live_rows_after_delete() {
         "latest snapshot should show 2 live rows, got:\n{out}"
     );
 }
+
+/// After a WAL-mode DELETE is folded into the checkpoint by `gc`, the folded
+/// manifest is published without the denormalized `row_counts`. `snapshots` must
+/// still report the live row count (from the canonical `.meta` sidecars), not 0.
+/// Regression test for M07 — the post-fold case the earlier test did not cover.
+#[tokio::test]
+async fn snapshots_live_rows_after_wal_fold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path();
+    let storage = LocalStorage::new(db).unwrap();
+
+    let mut writer = Writer::new(Arc::new(storage.clone()), "bench", make_schema())
+        .await
+        .unwrap();
+    writer
+        .insert_batch(make_batch(vec![1, 2, 3]))
+        .await
+        .unwrap();
+    writer.commit().await.unwrap();
+
+    let db_str = db.to_str().unwrap().to_string();
+    let table_arg = format!("{}/bench", db_str);
+
+    // DELETE through the CLI uses WAL fast-commit by default.
+    run_cli(&["query", &table_arg, "DELETE FROM bench WHERE id = 1"]);
+    // Fold the WAL into a fresh checkpoint; this republishes the manifest with
+    // `row_counts: None`, which used to make `snapshots` display 0 live rows.
+    run_cli(&["gc", &db_str, "bench"]);
+
+    let query_out = run_cli(&["query", &table_arg, "SELECT COUNT(*) FROM bench"]);
+    assert!(
+        query_out.contains("2"),
+        "live query should return 2 after fold, got:\n{query_out}"
+    );
+
+    let out = run_cli(&["snapshots", &db_str, "bench"]);
+    let data_lines: Vec<&str> = out
+        .lines()
+        .filter(|l| {
+            !l.trim().is_empty() && !l.contains("sequence") && !l.contains("pending mutation")
+        })
+        .collect();
+    let latest_line = data_lines.last().expect("expected a snapshot row");
+    assert!(
+        latest_line.contains(" 2 "),
+        "latest snapshot should show 2 live rows after WAL fold, got:\n{out}"
+    );
+}

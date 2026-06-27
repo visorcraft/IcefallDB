@@ -1559,7 +1559,7 @@ async fn run_snapshots(db: &Path, table: &str) -> anyhow::Result<()> {
         );
     }
     if any_wal_folded {
-        println!("* rows include WAL-folded live-row adjustments (DELETE-only exact; UPDATE/MERGE may undercount until checkpoint)");
+        println!("* rows include pending WAL mutations folded into the live count");
     }
     Ok(())
 }

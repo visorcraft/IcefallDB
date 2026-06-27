@@ -369,28 +369,38 @@ async fn read_manifest(storage: &dyn Storage, table: &str, seq: u64) -> Manifest
 }
 
 #[tokio::test]
-async fn test_gc_fails_when_manifest_pointer_missing() {
+async fn test_gc_repairs_missing_pointer() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let schema = make_schema();
     let mut writer = Writer::new(Arc::clone(&storage), "products", schema)
         .await
         .unwrap();
 
-    writer
-        .insert_batch(make_batch((1..=10).collect()))
-        .await
-        .unwrap();
-    writer.commit().await.unwrap();
+    for i in 0..3 {
+        let start = i * 10 + 1;
+        writer
+            .insert_batch(make_batch((start..start + 10).collect()))
+            .await
+            .unwrap();
+        writer.commit().await.unwrap();
+    }
 
-    // Simulate a missing manifest pointer.
+    // Delete the manifest pointer but leave the snapshots intact. The table
+    // still exists, so GC must fall back to the highest valid snapshot and
+    // repair the pointer (the same recovery as a corrupt pointer), not report
+    // the table as missing.
     storage.delete("products/_manifest.json").await.unwrap();
 
-    let err = GarbageCollector::new(storage.as_ref(), "products", 1)
+    let result = GarbageCollector::new(storage.as_ref(), "products", 1)
         .run()
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert!(matches!(err, IcefallDBError::TableNotFound(_)), "{err}");
+    assert_eq!(result.retained_snapshots, vec![3]);
+
+    let pointer_data = storage.read("products/_manifest.json").await.unwrap();
+    let pointer: serde_json::Value = serde_json::from_slice(&pointer_data).unwrap();
+    assert_eq!(pointer["latest"], 3);
 }
 
 #[tokio::test]

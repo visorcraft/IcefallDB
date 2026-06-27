@@ -700,6 +700,18 @@ class _NativeIcefallDBConnection:
         self.db_path = Path(db_path).resolve()
         self.tables = list(tables)
         self._snapshot = snapshot
+        # Capture the freshness signatures BEFORE opening the connection. The
+        # constructor eagerly loads providers at the live manifest; stat-ing
+        # afterwards could record a signature newer than the snapshot actually
+        # loaded (a commit landing mid-construction), which would suppress the
+        # first refresh and serve stale data. Capturing first guarantees the
+        # stored baseline is never newer than what the providers loaded (at worst
+        # a harmless redundant refresh). Snapshot-pinned connections are fixed and
+        # do not track freshness.
+        pending_sigs: dict[str, tuple] = {}
+        if self._snapshot is None:
+            for table in self.tables:
+                pending_sigs[table] = self._manifest_sig(self.db_path, table)
         self._conn = icefalldb_query_py.IcefallDBConnection(
             str(self.db_path),
             self.tables,
@@ -708,12 +720,7 @@ class _NativeIcefallDBConnection:
             result_cache_evict=result_cache_evict,
             key_file=str(key_file) if key_file is not None else None,
         )
-        # Per-table manifest/WAL signatures used to detect external writes.
-        # Snapshot-pinned connections remain fixed and do not track freshness.
-        self._manifest_sigs: dict[str, tuple] = {}
-        if self._snapshot is None:
-            for table in self.tables:
-                self._manifest_sigs[table] = self._manifest_sig(self.db_path, table)
+        self._manifest_sigs: dict[str, tuple] = pending_sigs
 
     @staticmethod
     def _manifest_sig(db_path: Path, table: str):
@@ -754,9 +761,13 @@ class _NativeIcefallDBConnection:
                     stale = True
                     break
         if stale:
+            # Capture signatures BEFORE refreshing so the stored baseline is
+            # never newer than the snapshot the providers reload — otherwise a
+            # commit landing between refresh and the re-stat would be absorbed
+            # silently, pinning this connection to the older snapshot.
+            pending = {t: self._manifest_sig(self.db_path, t) for t in self.tables}
             self._conn.refresh_providers()
-            for table in self.tables:
-                self._manifest_sigs[table] = self._manifest_sig(self.db_path, table)
+            self._manifest_sigs = pending
 
     def sql(self, sql: str, engine: str | None = None) -> IcefallDBQueryResult:
         """Execute ``sql`` and return a [`IcefallDBQueryResult`]."""
@@ -773,10 +784,12 @@ class _NativeIcefallDBConnection:
         """
         self._ensure_fresh(sql)
         affected = self._conn.mutate(sql)
-        # Record the new manifest/WAL signature so the next query does not pay
-        # for an unnecessary refresh.
-        for table in self.tables:
-            self._manifest_sigs[table] = self._manifest_sig(self.db_path, table)
+        # Deliberately do NOT stamp a post-write signature here. Stat-ing after
+        # the commit releases the write lock would capture any concurrent
+        # external commit too, so the next query would see current == stored and
+        # skip the refresh, serving that external write's data without loading it.
+        # Leaving the pre-write signature in place makes the next query observe a
+        # changed signature and refresh, picking up our write and any external one.
         return affected
 
     def clear_cache(self) -> None:

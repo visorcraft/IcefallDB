@@ -258,11 +258,13 @@ async fn test_cli_doctor_no_op_on_healthy_table() {
 }
 
 #[tokio::test]
-async fn test_cli_doctor_repair_fails_when_manifest_pointer_missing() {
+async fn test_cli_doctor_repair_recovers_missing_pointer() {
     let tmp = tempfile::tempdir().unwrap();
     setup_table(tmp.path()).await;
 
-    // Delete the manifest pointer. doctor now treats this as a missing table.
+    // Delete the manifest pointer. The table still exists (schema + snapshots),
+    // so `doctor --repair` must rebuild the pointer rather than refusing with
+    // "table not found".
     std::fs::remove_file(table_path(tmp.path()).join("_manifest.json")).unwrap();
 
     let output = Command::new(icefalldb_bin())
@@ -273,9 +275,12 @@ async fn test_cli_doctor_repair_fails_when_manifest_pointer_missing() {
         .output()
         .unwrap();
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("table 'products' not found"), "{stderr}");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(table_path(tmp.path()).join("_manifest.json").exists());
 }
 
 #[tokio::test]

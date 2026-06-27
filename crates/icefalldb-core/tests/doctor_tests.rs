@@ -1,6 +1,6 @@
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use icefalldb_core::metadata::{Column, Manifest, Schema};
+use icefalldb_core::metadata::{Column, Manifest, RowGroupMeta, Schema};
 use icefalldb_core::storage::local::LocalStorage;
 use icefalldb_core::storage::memory::MemoryStorage;
 use icefalldb_core::storage::Storage;
@@ -82,8 +82,9 @@ async fn test_doctor_no_op_on_healthy_table() {
 }
 
 #[tokio::test]
-async fn test_doctor_fails_when_manifest_pointer_missing() {
+async fn test_doctor_repairs_missing_pointer() {
     let (storage, table) = setup_committed_table().await;
+    let original_seq = read_latest_sequence(storage.as_ref(), &table).await;
 
     storage
         .delete(&format!("{}/_manifest.json", table))
@@ -91,9 +92,18 @@ async fn test_doctor_fails_when_manifest_pointer_missing() {
         .unwrap();
 
     let doctor = Doctor::new(storage.as_ref(), &table);
-    let err = doctor.repair().await.unwrap_err();
+    let result = doctor.repair().await.unwrap();
 
-    assert!(matches!(err, IcefallDBError::TableNotFound(_)), "{err}");
+    assert!(result.repaired);
+    let pointer_action = result
+        .actions
+        .iter()
+        .find(|a| a.kind == ActionKind::PointerUpdated)
+        .expect("expected PointerUpdated action");
+    assert_eq!(pointer_action.path, "_manifest.json");
+
+    let restored_seq = read_latest_sequence(storage.as_ref(), &table).await;
+    assert_eq!(restored_seq, original_seq);
 }
 
 #[tokio::test]
@@ -730,6 +740,16 @@ async fn test_doctor_repair_regenerates_missing_row_group_meta() {
     let manifest = read_latest_manifest(storage.as_ref(), &table).await;
     let meta_path = format!("{}/{}", table, manifest.row_groups[0].meta);
 
+    // Capture the original row-id segments so we can prove repair recovers them
+    // (from the checkpoint) rather than regenerating an empty, mutation-breaking
+    // sidecar.
+    let original_meta: RowGroupMeta =
+        serde_json::from_slice(&storage.read(&meta_path).await.unwrap()).unwrap();
+    assert!(
+        !original_meta.row_ids.is_empty(),
+        "test precondition: committed fragment should have row ids"
+    );
+
     storage.delete(&meta_path).await.unwrap();
 
     // `check` should report the missing sidecar before repair.
@@ -758,6 +778,16 @@ async fn test_doctor_repair_regenerates_missing_row_group_meta() {
     assert!(
         storage.exists(&meta_path).await.unwrap(),
         "regenerated meta file should exist"
+    );
+
+    // The regenerated canonical `.meta` must preserve the row-id segments,
+    // recovered from the checkpoint. Otherwise mutations on this fragment would
+    // break and a later checkpoint rebuild would lose them permanently.
+    let repaired_meta: RowGroupMeta =
+        serde_json::from_slice(&storage.read(&meta_path).await.unwrap()).unwrap();
+    assert_eq!(
+        repaired_meta.row_ids, original_meta.row_ids,
+        "repair should recover row-id segments from the checkpoint"
     );
 
     let check_after = icefalldb_core::Checker::new(storage.as_ref(), &table)

@@ -7,6 +7,7 @@ use icefalldb_core::storage::memory::MemoryStorage;
 use icefalldb_core::storage::{LockGuard, Storage};
 use icefalldb_core::writer::{InsertParquetOutcome, Writer};
 use icefalldb_core::Result;
+use icefalldb_core::{build_btree_index, DatabaseCatalog, IndexDefinition};
 use parquet::arrow::ArrowWriter;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1077,6 +1078,78 @@ async fn test_insert_duplicate_parquet_reuses_data_file() {
         total_rows += meta.rows;
     }
     assert_eq!(total_rows, 200);
+}
+
+/// Regression test for M01: content-addressed dedup must not bypass a UNIQUE
+/// index. Re-ingesting a Parquet file whose checksum matches an already-committed
+/// fragment used to take the reference-append shortcut, silently re-adding the
+/// same keys as live rows (with duplicate row_ids no rebuild could detect). With
+/// a unique index present, the second ingest must instead run the uniqueness
+/// probe and reject the duplicate keys.
+#[tokio::test]
+async fn test_duplicate_parquet_rejected_under_unique_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let schema = make_schema(1_000_000);
+
+    let parquet_path = dir.path().join("input.parquet");
+    let ids: Vec<i64> = (0..100).collect();
+    make_parquet_file(&parquet_path, &ids);
+
+    let mut writer = Writer::create(Arc::clone(&storage), "products", schema.clone())
+        .await
+        .unwrap();
+    writer
+        .insert_parquet(parquet_path.to_str().unwrap())
+        .await
+        .unwrap();
+
+    // Create a unique index on `id` over the committed fragment.
+    let catalog = DatabaseCatalog::new(Arc::clone(&storage));
+    let lock = catalog.acquire_lock(Duration::from_secs(30)).await.unwrap();
+    let manifest = read_latest_manifest(&storage, "products").await;
+    let definition = IndexDefinition {
+        name: "products_id_idx".into(),
+        table: "products".into(),
+        column: "id".into(),
+        unique: true,
+    };
+    let index = build_btree_index(storage.as_ref(), &definition, &manifest)
+        .await
+        .unwrap();
+    catalog
+        .create_index_definition_with_options(
+            &lock,
+            "products_id_idx",
+            "products",
+            "id",
+            "btree",
+            true,
+        )
+        .await
+        .unwrap();
+    index.save(storage.as_ref()).await.unwrap();
+    drop(lock);
+
+    // Re-ingest the identical file. The dedup shortcut must be skipped and the
+    // uniqueness probe must reject the duplicate keys.
+    let mut writer = Writer::new(Arc::clone(&storage), "products", schema.clone())
+        .await
+        .unwrap();
+    let result = writer.insert_parquet(parquet_path.to_str().unwrap()).await;
+    assert!(
+        matches!(result, Err(icefalldb_core::IcefallDBError::UniqueKeyViolation { .. })),
+        "expected UniqueKeyViolation re-ingesting a duplicate into a unique-indexed table, got {result:?}"
+    );
+
+    // No second fragment was committed: the table still has exactly one row group
+    // and 100 live rows.
+    let manifest = read_latest_manifest(&storage, "products").await;
+    assert_eq!(
+        manifest.row_groups.len(),
+        1,
+        "duplicate ingest must not add a fragment"
+    );
 }
 
 /// Integration test: insert a batch, confirm the manifest `RowGroupEntry.agg`

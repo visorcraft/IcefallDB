@@ -1087,21 +1087,44 @@ pub async fn build_scan_plan_at(
     build_scan_plan_from(storage, table, &manifest, &schema, false).await
 }
 
-/// Physical rows for a manifest, taken from the denormalized `row_counts` when
-/// available.
-fn manifest_physical_rows(m: &crate::metadata::Manifest) -> u64 {
-    m.row_counts
-        .as_ref()
-        .map(|c| c.iter().map(|&r| r as u64).sum())
-        .unwrap_or(0)
+/// Physical (pre-deletion) rows for a manifest.
+///
+/// Prefers the denormalized `row_counts`. When it is absent — WAL-folded
+/// checkpoints and UPDATE/MERGE commits publish manifests without it — falls
+/// back to summing each row group's canonical `.meta` `rows`, so the count is
+/// correct rather than silently zero.
+async fn manifest_physical_rows_resolved(
+    storage: &dyn Storage,
+    table: &str,
+    m: &crate::metadata::Manifest,
+) -> Result<u64> {
+    if let Some(counts) = &m.row_counts {
+        return Ok(counts.iter().map(|&r| r as u64).sum());
+    }
+    let mut total = 0u64;
+    for entry in &m.row_groups {
+        let meta_path = format!("{}/{}", table, entry.meta);
+        let bytes = match storage.read(&meta_path).await {
+            Ok(b) => b,
+            Err(e) if crate::is_not_found(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        let meta: RowGroupMeta = serde_json::from_slice(&bytes)?;
+        total += meta.rows as u64;
+    }
+    Ok(total)
 }
 
 /// Live rows for a manifest: physical rows minus `deleted_count` on each row
 /// group entry.
-fn manifest_live_rows(m: &crate::metadata::Manifest) -> u64 {
-    let physical = manifest_physical_rows(m);
+async fn manifest_live_rows_resolved(
+    storage: &dyn Storage,
+    table: &str,
+    m: &crate::metadata::Manifest,
+) -> Result<u64> {
+    let physical = manifest_physical_rows_resolved(storage, table, m).await?;
     let deleted: u64 = m.row_groups.iter().map(|e| e.deleted_count).sum();
-    physical.saturating_sub(deleted)
+    Ok(physical.saturating_sub(deleted))
 }
 
 /// Read the `_manifest.json` pointer sequence, if present and valid.
@@ -1121,14 +1144,13 @@ async fn read_pointer_sequence(storage: &dyn Storage, table: &str) -> Option<u64
 /// that cannot be read or parsed are silently skipped (consistent with the GC
 /// and doctor behaviour for missing/in-flight files).
 ///
-/// Row counts are *live* counts: physical rows minus `deleted_count`. For the
-/// current checkpoint snapshot, any pending mutation WAL records are folded so
-/// the displayed count matches the live query count.
-///
-/// The WAL-folded count is exact for DELETE-only WAL records. UPDATE/MERGE WAL
-/// records may append new fragments that are not included in the checkpoint's
-/// physical row count, so the displayed count may undercount until the next
-/// checkpoint.
+/// Row counts are *live* counts: physical rows minus `deleted_count`. Physical
+/// rows come from the denormalized `row_counts` when present and otherwise from
+/// each row group's canonical `.meta` sidecar, so a manifest published without
+/// `row_counts` (WAL fold, UPDATE/MERGE) is counted correctly rather than as
+/// zero. For the current checkpoint snapshot, any pending mutation WAL records
+/// are folded — including patch fragments appended by UPDATE/MERGE — so the
+/// displayed count matches a live `SELECT COUNT(*)`.
 pub async fn list_snapshots(storage: &dyn Storage, table: &str) -> Result<Vec<SnapshotInfo>> {
     require_table_exists(storage, table).await?;
 
@@ -1170,17 +1192,19 @@ pub async fn list_snapshots(storage: &dyn Storage, table: &str) -> Result<Vec<Sn
         };
 
         // For the current checkpoint snapshot, fold any pending WAL so the row
-        // count reflects live, committed deletion state. The physical row count
-        // stays anchored to the checkpoint manifest (the WAL fold drops
-        // `row_counts`); deleted rows come from the folded manifest.
+        // count reflects live, committed state. Physical rows are taken from the
+        // folded manifest's row groups (which include any UPDATE/MERGE patch
+        // fragments the WAL appended), so the displayed count matches a live
+        // `SELECT COUNT(*)` exactly rather than undercounting.
         let (rows, wal_folded) = if seq == current_seq {
-            let checkpoint_physical = manifest_physical_rows(&m);
             let live = crate::mutation_wal::live_manifest(storage, table, m.clone()).await?;
-            let deleted: u64 = live.row_groups.iter().map(|e| e.deleted_count).sum();
-            let live_rows = checkpoint_physical.saturating_sub(deleted);
-            (live_rows, live.sequence != m.sequence)
+            let rows = manifest_live_rows_resolved(storage, table, &live).await?;
+            (rows, live.sequence != m.sequence)
         } else {
-            (manifest_live_rows(&m), false)
+            (
+                manifest_live_rows_resolved(storage, table, &m).await?,
+                false,
+            )
         };
 
         out.push(SnapshotInfo {
@@ -1195,12 +1219,18 @@ pub async fn list_snapshots(storage: &dyn Storage, table: &str) -> Result<Vec<Sn
     Ok(out)
 }
 
-/// Verify that `table` exists by checking that its schema pointer, schema file,
-/// and manifest pointer are all present.
+/// Verify that `table` exists by checking that its schema pointer and the schema
+/// file it references are present.
+///
+/// `_schema.json` (plus the schema snapshot it names) is the authoritative
+/// existence marker for a table: the writer creates it first, and `doctor` can
+/// rebuild a lost `_manifest.json` pointer from the retained `_manifests/`
+/// snapshots. Gating on the manifest pointer here would therefore make a
+/// recoverable pointer loss look like a missing table and block its repair.
 ///
 /// This is the shared table-existence gate for maintenance commands. It returns
-/// [`IcefallDBError::TableNotFound`] when any of the required files is missing,
-/// including when `_schema.json` points to a schema snapshot that does not exist.
+/// [`IcefallDBError::TableNotFound`] when the schema pointer is missing or points
+/// to a schema snapshot that does not exist.
 pub async fn require_table_exists(storage: &dyn Storage, table: &str) -> Result<()> {
     let schema_pointer_path = format!("{}/_schema.json", table);
     let schema_id = match storage.exists(&schema_pointer_path).await? {
@@ -1217,11 +1247,6 @@ pub async fn require_table_exists(storage: &dyn Storage, table: &str) -> Result<
 
     let schema_path = format!("{}/{}", table, Schema::filename(schema_id));
     if !storage.exists(&schema_path).await? {
-        return Err(IcefallDBError::TableNotFound(table.to_string()));
-    }
-
-    let manifest_pointer_path = format!("{}/_manifest.json", table);
-    if !storage.exists(&manifest_pointer_path).await? {
         return Err(IcefallDBError::TableNotFound(table.to_string()));
     }
 

@@ -97,6 +97,14 @@ fn encrypted_import_and_query_roundtrip() {
         !out.status.success(),
         "query without the key unexpectedly succeeded"
     );
+    // The failure must be a clear missing-key error, not an opaque Parquet
+    // decrypt failure: a uniform-encrypted table reading a data column requires
+    // the footer key (M10 lazy-resolution must not take the no-key path here).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("encryption key not found"),
+        "expected a clear missing-key error, got: {stderr}"
+    );
 }
 
 #[test]

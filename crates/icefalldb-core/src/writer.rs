@@ -848,24 +848,45 @@ impl Writer {
             None
         };
 
+        // Content-addressed dedup (referencing an already-committed identical
+        // data file instead of copying it) skips row-id allocation and all index
+        // maintenance. That is unsafe when a UNIQUE index exists: the
+        // re-referenced fragment would re-add the same keys as live rows, with
+        // duplicate row_ids and no uniqueness probe, silently violating the
+        // invariant in a way later index rebuilds cannot even detect. When the
+        // table has a unique index, fall through to the normal copy path, which
+        // allocates fresh row_ids and runs `check_unique_adds` (rejecting the
+        // duplicate keys).
+        // ponytail: gate on unique indexes only; non-unique index staleness in
+        // the dedup path is a separate, pre-existing concern outside M01 scope.
+        let dedup_allowed = {
+            let catalog = crate::database_catalog::DatabaseCatalog::new(self.storage.clone());
+            let catalog_data = catalog.load().await?;
+            !catalog_data.indexes.values().any(|entry| {
+                entry.table == self.table && entry.unique && entry.index_type == "btree"
+            })
+        };
+
         // Check whether an identical row group is already committed; if so,
         // reference the existing data file instead of copying it again.
         let (latest_seq, current_manifest) = self.load_current_manifest().await?;
         let existing_row_groups = &current_manifest.row_groups;
-        for rg in existing_row_groups {
-            let meta_path = format!("{}/{}", self.table, rg.meta);
-            let meta_bytes = self.storage.read(&meta_path).await?;
-            let meta: RowGroupMeta = serde_json::from_slice(&meta_bytes)?;
-            if meta.checksum == data_checksum {
-                return self
-                    .append_reference_row_group(
-                        rg,
-                        latest_seq,
-                        existing_row_groups,
-                        partition_values.clone(),
-                        &current_manifest,
-                    )
-                    .await;
+        if dedup_allowed {
+            for rg in existing_row_groups {
+                let meta_path = format!("{}/{}", self.table, rg.meta);
+                let meta_bytes = self.storage.read(&meta_path).await?;
+                let meta: RowGroupMeta = serde_json::from_slice(&meta_bytes)?;
+                if meta.checksum == data_checksum {
+                    return self
+                        .append_reference_row_group(
+                            rg,
+                            latest_seq,
+                            existing_row_groups,
+                            partition_values.clone(),
+                            &current_manifest,
+                        )
+                        .await;
+                }
             }
         }
 
@@ -5419,8 +5440,14 @@ pub fn compute_row_group_meta(
 /// Used by [`crate::doctor::Doctor`] to recreate a missing row-group metadata
 /// file. Statistics are derived from footer column-chunk statistics; encrypted
 /// columns (when known) are skipped so the regenerated plaintext sidecar does
-/// not leak protected values. Row-ID segments cannot be recovered from the
-/// footer and are left empty.
+/// not leak protected values.
+///
+/// Row-ID segments cannot be recovered from the Parquet footer, but they *are*
+/// retained in the snapshot checkpoint's fragment summary. The caller passes the
+/// recovered segments in via `row_ids`; this keeps the regenerated canonical
+/// `.meta` consistent with the data so mutations (which locate rows by row id)
+/// keep working and a later checkpoint rebuild does not permanently lose them.
+/// Pass an empty slice when the segments are genuinely unrecoverable.
 pub fn compute_row_group_meta_from_footer(
     rg_id: &str,
     schema_id: u64,
@@ -5428,6 +5455,7 @@ pub fn compute_row_group_meta_from_footer(
     parquet_bytes: &[u8],
     parquet_metadata: &parquet::file::metadata::ParquetMetaData,
     encrypted_columns: &std::collections::HashSet<String>,
+    row_ids: &[RowIdSegment],
 ) -> Result<RowGroupMeta> {
     let columns = derive_footer_stats_for_repair(schema, parquet_metadata, encrypted_columns)?;
     let column_offsets = compute_column_offsets(parquet_metadata, schema);
@@ -5438,7 +5466,7 @@ pub fn compute_row_group_meta_from_footer(
         columns,
         column_offsets,
         sort: schema.sort.clone(),
-        row_ids: vec![],
+        row_ids: row_ids.to_vec(),
         checksum: String::new(),
         meta_checksum: String::new(),
     };
