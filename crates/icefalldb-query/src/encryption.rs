@@ -234,6 +234,11 @@ impl EncryptionKeyResolver {
             .iter()
             .any(|name| self.column_key_ids.contains_key(name));
 
+        // Track whether we are taking the "no footer key needed" dummy path,
+        // rather than inferring it from the key bytes. A caller could legitimately
+        // configure a footer key of 16 zero bytes, and that real key must still
+        // verify the footer signature.
+        let mut disable_footer_verification = false;
         let footer = match self.provider.get(&self.footer_key_id, &self.aad).await {
             Ok(footer) => footer.as_slice().to_vec(),
             Err(e) => {
@@ -243,13 +248,13 @@ impl EncryptionKeyResolver {
                     // No decryption is actually required for this query; use a
                     // dummy footer key and disable signature verification so the
                     // read can proceed without the footer key.
+                    disable_footer_verification = true;
                     vec![0u8; 16]
                 } else {
                     return Err(map_enc_err(e));
                 }
             }
         };
-        let disable_footer_verification = footer == vec![0u8; 16];
 
         let mut column_keys = std::collections::BTreeMap::new();
         for name in needed_columns {
@@ -390,6 +395,7 @@ fn parse_factory_options(options: &EncryptionFactoryOptions) -> IcefallDBEncrypt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use icefalldb_core::encryption::StaticKeyProvider;
 
     #[test]
     fn derive_aad_empty_when_no_identity() {
@@ -451,5 +457,50 @@ mod tests {
         };
         let err = c.derive_aad().unwrap_err();
         assert!(err.to_string().contains("aad_prefix_b64"));
+    }
+
+    #[tokio::test]
+    async fn zero_byte_footer_key_still_verifies_signature() {
+        // A real footer key that happens to be 16 zero bytes must not be
+        // confused with the dummy key used when the caller lacks the footer key.
+        // Footer-signature verification must remain enabled.
+        let keys = std::collections::HashMap::from([(KeyIdentifier::new("footer"), vec![0u8; 16])]);
+        let provider = Arc::new(StaticKeyProvider::new(keys).unwrap());
+        let resolver = EncryptionKeyResolver::new(
+            provider,
+            KeyIdentifier::new("footer"),
+            std::collections::BTreeMap::new(),
+            Vec::new(),
+            true, // plaintext_footer
+        );
+
+        let props = resolver
+            .resolve_for_columns(&std::collections::HashSet::new())
+            .await
+            .unwrap();
+
+        assert!(props.check_plaintext_footer_integrity());
+    }
+
+    #[tokio::test]
+    async fn missing_footer_key_disables_verification_for_plaintext_query() {
+        // When the footer key is missing, no encrypted column is referenced, and
+        // the table has a plaintext footer, the resolver uses a dummy key and
+        // disables footer verification so the read can proceed.
+        let provider = Arc::new(StaticKeyProvider::new(std::iter::empty()).unwrap());
+        let mut column_keys = std::collections::BTreeMap::new();
+        column_keys.insert("secret".to_string(), KeyIdentifier::new("secret-key"));
+        let resolver = EncryptionKeyResolver::new(
+            provider,
+            KeyIdentifier::new("footer"),
+            column_keys,
+            Vec::new(),
+            true, // plaintext_footer
+        );
+
+        let needed = std::collections::HashSet::from(["plain".to_string()]);
+        let props = resolver.resolve_for_columns(&needed).await.unwrap();
+
+        assert!(!props.check_plaintext_footer_integrity());
     }
 }
