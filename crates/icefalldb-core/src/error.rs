@@ -77,6 +77,12 @@ pub enum IcefallDBError {
     LegacyIndex { table: String, name: String },
     #[error("snapshot {0} not found")]
     SnapshotNotFound(u64),
+    #[error("unique key violation on index '{index}' of table '{table}': duplicate key '{key}'")]
+    UniqueKeyViolation {
+        table: String,
+        index: String,
+        key: String,
+    },
     #[error("{0}")]
     Other(#[source] Box<dyn std::error::Error + Send + Sync>),
 }

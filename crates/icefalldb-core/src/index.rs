@@ -665,6 +665,9 @@ pub async fn list_index_names(storage: &dyn Storage, table: &str) -> Result<Vec<
 ///
 /// Row IDs are stable across compaction and relocation, so the resulting index
 /// is safe to use with any snapshot that references this generation.
+///
+/// If `definition.unique` is `true`, the build rejects any key that maps to more
+/// than one live row id.
 pub async fn build_btree_index(
     storage: &dyn Storage,
     definition: &IndexDefinition,
@@ -679,6 +682,18 @@ pub async fn build_btree_index(
     for ids in entries.values_mut() {
         ids.sort_unstable();
         ids.dedup();
+    }
+
+    if definition.unique {
+        for (key, ids) in &entries {
+            if ids.len() > 1 {
+                return Err(IcefallDBError::UniqueKeyViolation {
+                    table: definition.table.clone(),
+                    index: definition.name.clone(),
+                    key: key.clone(),
+                });
+            }
+        }
     }
 
     Ok(BTreeIndex {
@@ -869,6 +884,59 @@ fn scalar_to_key(array: &dyn Array, row: usize) -> Result<String> {
     }
 }
 
+/// Verify that `adds` do not violate the uniqueness invariant of `definition`.
+///
+/// `existing_index` is the index generation before the change (base plus applied
+/// deltas). `tombstoned_row_ids` are row IDs that will be removed before the adds
+/// are applied; they are allowed to reappear under the same key (used by UPDATE).
+///
+/// Returns `UniqueKeyViolation` when:
+///   * two adds share the same key but different row ids, or
+///   * an add's key already exists in the existing index with a live row id that
+///     is not about to be tombstoned.
+fn check_unique_adds(
+    definition: &IndexDefinition,
+    existing_index: &BTreeIndex,
+    adds: &[(String, u64)],
+    tombstoned_row_ids: &[u64],
+) -> Result<()> {
+    if !definition.unique {
+        return Ok(());
+    }
+
+    let tombstoned: std::collections::HashSet<u64> = tombstoned_row_ids.iter().copied().collect();
+    let mut seen_in_batch: std::collections::HashMap<&str, u64> =
+        std::collections::HashMap::with_capacity(adds.len());
+
+    for (key, row_id) in adds {
+        // Duplicate within the incoming batch.
+        if let Some(&first_rid) = seen_in_batch.get(key.as_str()) {
+            if first_rid != *row_id {
+                return Err(IcefallDBError::UniqueKeyViolation {
+                    table: definition.table.clone(),
+                    index: definition.name.clone(),
+                    key: key.clone(),
+                });
+            }
+        } else {
+            seen_in_batch.insert(key, *row_id);
+        }
+
+        // Collision with an existing live key that is not being tombstoned.
+        if let Some(existing_ids) = existing_index.entries.get(key) {
+            if existing_ids.iter().any(|id| !tombstoned.contains(id)) {
+                return Err(IcefallDBError::UniqueKeyViolation {
+                    table: definition.table.clone(),
+                    index: definition.name.clone(),
+                    key: key.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub struct IndexMaintainer;
 
 impl IndexMaintainer {
@@ -978,6 +1046,13 @@ impl IndexMaintainer {
                 continue;
             }
 
+            let definition = IndexDefinition {
+                name: name.clone(),
+                table: entry.table.clone(),
+                column: entry.column.clone(),
+                unique: entry.unique,
+            };
+
             // Build the adds: for each updated row, extract the new value.
             let schema = updated_rows.schema();
             let col_idx = match schema.index_of(&entry.column) {
@@ -1003,6 +1078,16 @@ impl IndexMaintainer {
                 .get(name)
                 .cloned()
                 .unwrap_or_default();
+
+            // For unique indexes, verify the new values do not collide with
+            // existing live keys (other than the row being updated itself).
+            if definition.unique && !adds.is_empty() {
+                if let Some(existing) =
+                    load_index_by_ref(storage.as_ref(), table, name, &current_ref).await?
+                {
+                    check_unique_adds(&definition, &existing, &adds, row_ids)?;
+                }
+            }
 
             // Write the delta (tombstones = all updated row_ids; adds = new values).
             let (new_ref, delta_path) = append_index_delta(
@@ -1100,6 +1185,17 @@ impl IndexMaintainer {
             let adds =
                 collect_index_adds_for_fragments(storage.as_ref(), &definition, new_fragments)
                     .await?;
+
+            // For unique indexes, verify the new keys do not collide with existing
+            // live keys and are unique within the incoming batch.
+            if definition.unique && !adds.is_empty() {
+                if let Some(existing) =
+                    load_index_by_ref(storage.as_ref(), table, name, &current_ref).await?
+                {
+                    check_unique_adds(&definition, &existing, &adds, &[])?;
+                }
+            }
+
             let (new_ref, delta_path) =
                 append_index_delta(storage.as_ref(), table, name, &[], adds, seq, &current_ref)
                     .await?;
@@ -2559,6 +2655,400 @@ mod tests {
             resolved.lookup("new@x.com"),
             &[0u64],
             "new@x.com must yield row_id 0 after the update (add inserts it)"
+        );
+    }
+
+    // ─── unique-index enforcement tests (M01) ───────────────────────────────
+
+    /// Creating a unique index over data that already contains duplicate live
+    /// keys must fail with `UniqueKeyViolation`.
+    #[tokio::test]
+    async fn unique_index_creation_rejects_duplicate_live_keys() {
+        use crate::catalog::Catalog;
+        use crate::database_catalog::DatabaseCatalog;
+        use crate::metadata::{Column, Schema};
+        use crate::Writer;
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use std::time::Duration;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+
+        let schema = Schema {
+            schema_id: 1,
+            columns: vec![Column::new("v", "int64", false)],
+            partition_by: None,
+            sort: None,
+            agg_group_keys: None,
+            row_group_target_rows: 1000,
+            row_group_target_bytes: 1 << 30,
+            dropped_columns: vec![],
+            max_field_id: 0,
+        };
+
+        let dbcat = DatabaseCatalog::new(storage.clone());
+        let guard = dbcat.acquire_lock(Duration::from_secs(5)).await.unwrap();
+        dbcat
+            .create_table(&guard, "uniq_create", &schema)
+            .await
+            .unwrap();
+        dbcat
+            .create_index_definition_with_options(
+                &guard,
+                "v_uniq",
+                "uniq_create",
+                "v",
+                "btree",
+                true,
+            )
+            .await
+            .unwrap();
+        drop(guard);
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::Int64,
+            false,
+        )]));
+
+        // Insert duplicate live keys.
+        let mut writer = Writer::new(storage.clone(), "uniq_create", schema.clone())
+            .await
+            .unwrap();
+        writer
+            .insert_batch(
+                RecordBatch::try_new(
+                    Arc::clone(&arrow_schema),
+                    vec![Arc::new(Int64Array::from(vec![1i64, 1, 2]))],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let err = writer.commit().await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IcefallDBError::UniqueKeyViolation {
+                    ref table,
+                    ref index,
+                    ref key,
+                } if table == "uniq_create" && index == "v_uniq" && key == "1"
+            ),
+            "expected UniqueKeyViolation for duplicate key 1, got {err:?}"
+        );
+
+        // The table must remain empty because the commit was rejected.
+        let latest = Catalog::load(storage.as_ref(), "uniq_create")
+            .await
+            .unwrap()
+            .latest_manifest()
+            .cloned();
+        assert!(
+            latest.map(|m| m.row_groups.is_empty()).unwrap_or(true),
+            "commit must be rejected; table should be empty"
+        );
+    }
+
+    /// Appending rows whose key already exists as a live row must fail with
+    /// `UniqueKeyViolation`.
+    #[tokio::test]
+    async fn unique_index_append_rejects_duplicate_keys() {
+        use crate::database_catalog::DatabaseCatalog;
+        use crate::metadata::{Column, Schema};
+        use crate::Writer;
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use std::time::Duration;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+
+        let schema = Schema {
+            schema_id: 1,
+            columns: vec![Column::new("v", "int64", false)],
+            partition_by: None,
+            sort: None,
+            agg_group_keys: None,
+            row_group_target_rows: 1000,
+            row_group_target_bytes: 1 << 30,
+            dropped_columns: vec![],
+            max_field_id: 0,
+        };
+
+        let dbcat = DatabaseCatalog::new(storage.clone());
+        let guard = dbcat.acquire_lock(Duration::from_secs(5)).await.unwrap();
+        dbcat
+            .create_table(&guard, "uniq_append", &schema)
+            .await
+            .unwrap();
+        dbcat
+            .create_index_definition_with_options(
+                &guard,
+                "v_uniq",
+                "uniq_append",
+                "v",
+                "btree",
+                true,
+            )
+            .await
+            .unwrap();
+        drop(guard);
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::Int64,
+            false,
+        )]));
+
+        let mut writer = Writer::new(storage.clone(), "uniq_append", schema.clone())
+            .await
+            .unwrap();
+        writer
+            .insert_batch(
+                RecordBatch::try_new(
+                    Arc::clone(&arrow_schema),
+                    vec![Arc::new(Int64Array::from(vec![1i64, 2]))],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        writer.commit().await.unwrap();
+
+        // Append a duplicate key.
+        let mut writer = Writer::new(storage.clone(), "uniq_append", schema.clone())
+            .await
+            .unwrap();
+        writer
+            .insert_batch(
+                RecordBatch::try_new(
+                    Arc::clone(&arrow_schema),
+                    vec![Arc::new(Int64Array::from(vec![1i64]))],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let err = writer.commit().await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IcefallDBError::UniqueKeyViolation {
+                    ref table,
+                    ref index,
+                    ref key,
+                } if table == "uniq_append" && index == "v_uniq" && key == "1"
+            ),
+            "expected UniqueKeyViolation for duplicate key 1 on append, got {err:?}"
+        );
+    }
+
+    /// Re-inserting a key whose only live row has been deleted must succeed.
+    #[tokio::test]
+    async fn unique_index_allows_reinsert_after_delete() {
+        use crate::database_catalog::DatabaseCatalog;
+        use crate::metadata::{Column, Schema};
+        use crate::Writer;
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+
+        let schema = Schema {
+            schema_id: 1,
+            columns: vec![Column::new("v", "int64", false)],
+            partition_by: None,
+            sort: None,
+            agg_group_keys: None,
+            row_group_target_rows: 1000,
+            row_group_target_bytes: 1 << 30,
+            dropped_columns: vec![],
+            max_field_id: 0,
+        };
+
+        let dbcat = DatabaseCatalog::new(storage.clone());
+        let guard = dbcat.acquire_lock(Duration::from_secs(5)).await.unwrap();
+        dbcat
+            .create_table(&guard, "uniq_del", &schema)
+            .await
+            .unwrap();
+        dbcat
+            .create_index_definition_with_options(&guard, "v_uniq", "uniq_del", "v", "btree", true)
+            .await
+            .unwrap();
+        drop(guard);
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::Int64,
+            false,
+        )]));
+
+        let mut writer = Writer::new(storage.clone(), "uniq_del", schema.clone())
+            .await
+            .unwrap();
+        writer
+            .insert_batch(
+                RecordBatch::try_new(
+                    Arc::clone(&arrow_schema),
+                    vec![Arc::new(Int64Array::from(vec![1i64, 2]))],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        writer.commit().await.unwrap();
+
+        // Delete the row with value 1 (physical offset 0).
+        let manifest_before = {
+            use crate::catalog::Catalog;
+            let cat = Catalog::load(storage.as_ref(), "uniq_del").await.unwrap();
+            cat.latest_manifest().unwrap().clone()
+        };
+        let frag_id = manifest_before.row_groups[0].fragment_id;
+
+        let mut writer = Writer::new(storage.clone(), "uniq_del", schema.clone())
+            .await
+            .unwrap();
+        writer
+            .commit_deletes(HashMap::from([(frag_id, vec![0u32])]))
+            .await
+            .unwrap();
+
+        // Re-insert the deleted key.
+        let mut writer = Writer::new(storage.clone(), "uniq_del", schema.clone())
+            .await
+            .unwrap();
+        writer
+            .insert_batch(
+                RecordBatch::try_new(
+                    Arc::clone(&arrow_schema),
+                    vec![Arc::new(Int64Array::from(vec![1i64]))],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        writer.commit().await.unwrap();
+
+        use crate::catalog::Catalog;
+        let manifest = Catalog::load(storage.as_ref(), "uniq_del")
+            .await
+            .unwrap()
+            .latest_manifest()
+            .unwrap()
+            .clone();
+        let iref = manifest
+            .index_generations
+            .get("v_uniq")
+            .expect("unique index generation must exist")
+            .clone();
+        let index = load_index_by_ref(storage.as_ref(), "uniq_del", "v_uniq", &iref)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(index.lookup("1").len(), 1, "exactly one live row for key 1");
+        assert_eq!(index.lookup("2").len(), 1, "exactly one live row for key 2");
+    }
+
+    /// Updating a unique-indexed column to a value that already belongs to a
+    /// different live row must fail with `UniqueKeyViolation`.
+    #[tokio::test]
+    async fn unique_index_update_rejects_collision() {
+        use crate::database_catalog::DatabaseCatalog;
+        use crate::metadata::{Column, Schema};
+        use crate::writer::{MatchLoc, Writer};
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use std::time::Duration;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+
+        let schema = Schema {
+            schema_id: 1,
+            columns: vec![Column::new("v", "int64", false)],
+            partition_by: None,
+            sort: None,
+            agg_group_keys: None,
+            row_group_target_rows: 1000,
+            row_group_target_bytes: 1 << 30,
+            dropped_columns: vec![],
+            max_field_id: 0,
+        };
+
+        let dbcat = DatabaseCatalog::new(storage.clone());
+        let guard = dbcat.acquire_lock(Duration::from_secs(5)).await.unwrap();
+        dbcat
+            .create_table(&guard, "uniq_upd", &schema)
+            .await
+            .unwrap();
+        dbcat
+            .create_index_definition_with_options(&guard, "v_uniq", "uniq_upd", "v", "btree", true)
+            .await
+            .unwrap();
+        drop(guard);
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::Int64,
+            false,
+        )]));
+
+        let mut writer = Writer::new(storage.clone(), "uniq_upd", schema.clone())
+            .await
+            .unwrap();
+        writer
+            .insert_batch(
+                RecordBatch::try_new(
+                    Arc::clone(&arrow_schema),
+                    vec![Arc::new(Int64Array::from(vec![1i64, 2]))],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        writer.commit().await.unwrap();
+
+        // Attempt to UPDATE row_id 0 (value 1) to value 2, colliding with row_id 1.
+        let mut writer = Writer::new(storage.clone(), "uniq_upd", schema.clone())
+            .await
+            .unwrap();
+        let updated_batch = RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![Arc::new(Int64Array::from(vec![2i64]))],
+        )
+        .unwrap();
+        let err = writer
+            .commit_update(
+                updated_batch,
+                vec![MatchLoc {
+                    fragment_id: 0,
+                    offset: 0,
+                    row_id: 0,
+                }],
+                &["v".to_string()],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                IcefallDBError::UniqueKeyViolation {
+                    ref table,
+                    ref index,
+                    ref key,
+                } if table == "uniq_upd" && index == "v_uniq" && key == "2"
+            ),
+            "expected UniqueKeyViolation for update collision on key 2, got {err:?}"
         );
     }
 }

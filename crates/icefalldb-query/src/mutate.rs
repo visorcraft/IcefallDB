@@ -836,10 +836,15 @@ async fn execute_merge_to_delta(
                     offset: (a & 0xFFFF_FFFF) as u32,
                     row_id: ids.value(i),
                 };
-                // In the unique-index contract at most one live row exists per key,
-                // so first-seen wins; if for any reason a second entry appears we
-                // keep the first (consistent with the pre-existing single-probe behaviour).
-                live_map.entry(key_sv).or_insert(loc);
+                // In the unique-index contract at most one live row exists per key.
+                // A second live entry means the contract is already broken; refuse the
+                // MERGE rather than silently masking the corruption.
+                if live_map.contains_key(&key_sv) {
+                    return Err(QueryError::Other(format!(
+                        "unique key violation on table '{table}': key {key_sv} has more than one live target row"
+                    )));
+                }
+                live_map.insert(key_sv, loc);
             }
         }
     }
@@ -4173,6 +4178,59 @@ mod tests {
             scalar_i64(&ctx, "SELECT COUNT(*) FROM t_merge_new_key").await,
             11,
             "total row count must increase to 11 after insert"
+        );
+    }
+
+    /// MERGE with duplicate keys in the source relation must be rejected.
+    ///
+    /// SQL-standard MERGE is undefined when the source contains duplicate match
+    /// keys; `DupPolicy::Error` catches this before any target mutation.
+    #[tokio::test]
+    async fn merge_rejects_duplicate_source_keys() {
+        let (ctx, storage, root, _tmp) = registered_table_unique("t_merge_dup_src", 10).await;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let src = RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![7i64, 7])),
+                Arc::new(Int64Array::from(vec![700i64, 707])),
+            ],
+        )
+        .unwrap();
+
+        let err = execute_merge(
+            &ctx,
+            Arc::clone(&storage),
+            &root,
+            "t_merge_dup_src",
+            "id",
+            src,
+            MatchedAction::UpdateAll,
+            NotMatchedAction::Insert,
+        )
+        .await
+        .unwrap_err();
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duplicate key") || msg.contains("duplicate"),
+            "expected duplicate-source-key error, got: {msg}"
+        );
+
+        // No rows must have been changed.
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT COUNT(*) FROM t_merge_dup_src").await,
+            10,
+            "duplicate-source MERGE must not modify the table"
+        );
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT v FROM t_merge_dup_src WHERE id = 7").await,
+            70,
+            "row id=7 must be unchanged"
         );
     }
 
