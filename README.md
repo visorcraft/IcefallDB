@@ -68,22 +68,23 @@ scan at all). Both are on by default.
 | Query shape | first run | cached |
 |---|---:|---:|
 | `COUNT(*)` over 10M rows (from metadata) | 0.1 ms | **0.1 ms** |
-| filtered scan returning rows, 2 predicates (1M) | 7.5 ms | **4.8 ms** |
-| `GROUP BY category` + `AVG` (1M rows) | 3.8 ms | **0.13 ms** |
-| indexed equality, `COUNT` + `SUM` | 2.4 ms | **0.07 ms** |
-| sorted time-window `GROUP BY` | 4.2 ms | **0.10 ms** |
-| 100M x 10 join + `GROUP BY` | 4.9 ms | **0.12 ms** |
-| clustered wide filter, 4 predicates (10M) | 19 ms | **0.07 ms** |
-| wide filter, 4-predicate `COUNT` (10M) | 44 ms | **0.07 ms** |
-| wide aggregate, 6 aggregates + 3-predicate filter (10M) | 90 ms | **0.12 ms** |
+| filtered scan, 2 predicates, 50k rows returned (1M) | 5.8 ms | **0.24 ms** |
+| `GROUP BY category` + `AVG` (1M rows) | 6.3 ms | **0.14 ms** |
+| indexed equality, `COUNT` + `SUM` | 3.0 ms | **0.10 ms** |
+| sorted time-window `GROUP BY` | 5.3 ms | **0.16 ms** |
+| 100M x 10 join + `GROUP BY` | 5.4 ms | **0.14 ms** |
+| clustered wide filter, 4 predicates (10M) | 21 ms | **0.10 ms** |
+| wide filter, 4-predicate `COUNT` (10M) | 47 ms | **0.10 ms** |
+| wide aggregate, 6 aggregates + 3-predicate filter (10M) | 87 ms | **0.16 ms** |
 
 IcefallDB is built for the analytical queries that keep coming back. The first run
 pays for the scan; every repeat comes back from cache in well under a millisecond,
-so a 6-aggregate scan over 10M rows drops from ~90 ms to ~0.1 ms. And
+so a 6-aggregate scan over 10M rows drops from ~85 ms to ~0.15 ms. And
 `COUNT`/`MIN`/`MAX`/`SUM`/`AVG` over an unfiltered table never scan at all - they
-are composed from sidecar statistics, sub-millisecond even on the first run. The
-one case the cache cannot speed up is a query that returns many rows (the filtered
-scan): there the cost is handing back the result set, not computing it. Aggregate
+are composed from sidecar statistics, sub-millisecond even on the first run. Even
+a filtered scan returning tens of thousands of rows is cached as Arrow IPC, so the
+repeat comes back in a fraction of a millisecond; the only cost the cache cannot
+remove is materializing a large result set into native Python objects. Aggregate
 results are exact - byte-equal for integers, within sketch error for the optional
 approximate aggregates.
 
