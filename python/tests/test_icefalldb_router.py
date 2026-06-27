@@ -410,6 +410,30 @@ def test_explicit_duckdb_rejects_merge_updated_rows(sample_db):
     ]
 
 
+def test_explicit_duckdb_ignores_torn_first_wal_record(sample_db):
+    """A torn non-durable WAL append must not make a clean table dirty."""
+    wal_log = sample_db / "events" / "_wal" / "mutations.log"
+    wal_log.parent.mkdir()
+    wal_log.write_bytes(b'{"sequence":2,"fragment_deletes":[\n')
+
+    assert _table_has_active_deletions(sample_db, "events") is False
+
+    duck = icefalldb.attach(str(sample_db), tables=["events"], engine="duckdb")
+    assert duck.execute("SELECT COUNT(*) FROM events").fetchall() == [(8,)]
+
+
+def test_explicit_duckdb_fails_closed_on_unreadable_wal(sample_db):
+    """If WAL state cannot be read, DuckDB must not guess that it is safe."""
+    wal_log = sample_db / "events" / "_wal" / "mutations.log"
+    wal_log.mkdir(parents=True)
+
+    with pytest.raises(IcefallDBError, match="cannot read mutation WAL"):
+        _table_has_active_deletions(sample_db, "events")
+
+    with pytest.raises(IcefallDBError, match="cannot read mutation WAL"):
+        icefalldb.attach(str(sample_db), tables=["events"], engine="duckdb")
+
+
 def test_hybrid_delete_correctness_via_native(sample_db):
     """Rows deleted through hybrid stay deleted; survivors are intact."""
     if not _native_available():

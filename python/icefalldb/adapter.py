@@ -1470,6 +1470,55 @@ def _read_latest_manifest(db_path: Path, table: str) -> Optional[dict]:
     return _read_json(manifest_path)
 
 
+_WAL_CHECKSUM_RE = re.compile(rb'("checksum":")(sha256:[0-9a-f]{64})(")')
+
+
+def _read_valid_mutation_wal_sequences(wal_log: Path) -> list[int]:
+    """Return the durable-prefix mutation WAL sequence numbers.
+
+    Rust's ``mutation_wal::read_records`` stops at the first unparsable or
+    checksum-failing line. Mirror that behavior here so DuckDB is rejected only
+    for replayable WAL records, while torn bytes from a failed append do not
+    make an otherwise clean table permanently DuckDB-ineligible.
+    """
+    try:
+        data = wal_log.read_bytes()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise IcefallDBError(f"cannot read mutation WAL at {wal_log}: {exc}") from exc
+
+    sequences: list[int] = []
+    for line in data.split(b"\n"):
+        if not line:
+            continue
+        match = _WAL_CHECKSUM_RE.search(line)
+        if match is None:
+            break
+
+        bare_line = (
+            line[: match.start()]
+            + match.group(1)
+            + match.group(3)
+            + line[match.end() :]
+        )
+        expected = f"sha256:{hashlib.sha256(bare_line).hexdigest()}".encode()
+        if expected != match.group(2):
+            break
+
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            break
+        sequence = record.get("sequence") if isinstance(record, dict) else None
+        if not isinstance(sequence, int) or isinstance(sequence, bool):
+            break
+        sequences.append(sequence)
+
+    sequences.sort()
+    return sequences
+
+
 def _table_has_active_deletions(db_path: Path, table: str) -> bool:
     """Return True if ``table`` has any tombstoned rows in its latest snapshot.
 
@@ -1481,13 +1530,13 @@ def _table_has_active_deletions(db_path: Path, table: str) -> bool:
     records are not yet reflected in the checkpoint manifest the DuckDB path
     reads, so a DuckDB view would be stale until the next checkpoint.
     """
-    wal_log = _table_dir_for(db_path, table) / "_wal" / "mutations.log"
-    try:
-        if wal_log.is_file() and wal_log.stat().st_size > 0:
-            return True
-    except OSError:
-        pass
     manifest = _read_latest_manifest(db_path, table)
+    manifest_sequence = manifest.get("sequence", 0) if manifest is not None else 0
+    wal_log = _table_dir_for(db_path, table) / "_wal" / "mutations.log"
+    if any(
+        seq > manifest_sequence for seq in _read_valid_mutation_wal_sequences(wal_log)
+    ):
+        return True
     if manifest is None:
         return False
     for rg in manifest.get("row_groups", []):
