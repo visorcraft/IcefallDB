@@ -1110,10 +1110,11 @@ fn coerce_update_null_literals(
             ))
         })?;
         if !field.is_nullable() {
-            return Err(QueryError::Other(format!(
-                "UPDATE SET NULL cannot assign to non-nullable column '{col_name}' \
-                 in table '{table_name}'"
-            )));
+            return Err(QueryError::Core(IcefallDBError::SchemaMismatch {
+                column: col_name.clone(),
+                expected: "non-nullable column cannot be assigned NULL".into(),
+                path: table_name.to_string(),
+            }));
         }
         let typed_null = ScalarValue::try_from(field.data_type()).map_err(|e| {
             QueryError::Other(format!(
@@ -2301,10 +2302,12 @@ async fn materialize_merge_source(
 
 /// Coerce the schema of `batch` to match the registered target table's schema.
 ///
-/// `Writer::insert_batch` and `Writer::commit_update` require the source batch
-/// schema to exactly match the table schema, including the `is_nullable` flag
-/// on each field.  DataFusion's VALUES materializer always produces nullable
-/// columns.  This function:
+/// `Writer::insert_batch` requires the source batch schema to exactly match
+/// the table schema, including the `is_nullable` flag on each field.
+/// `Writer::commit_update` compares names and types only, but MERGE coerces
+/// the matched source batch as well so the patch fragment schema is tidy.
+/// DataFusion's VALUES materializer always produces nullable columns.
+/// This function:
 ///
 /// 1. Retrieves the target table's Arrow schema from the registered provider
 ///    (excluding the pseudo-columns `_rowid` and `_rowaddr`).
@@ -3758,6 +3761,41 @@ mod tests {
             .await,
             1,
             "nullable Boolean column must be set to NULL"
+        );
+    }
+
+    /// Regression (M02): assigning a non-null literal to a nullable column must
+    /// succeed even when DataFusion projects the assignment as non-nullable.
+    ///
+    /// The writer's defensive schema check for `commit_update` used to compare
+    /// nullability as well as names and types, which rejected this valid update.
+    #[tokio::test]
+    async fn end_to_end_sql_update_nullable_column_to_non_null_literal() {
+        let (ctx, storage, root, _tmp) =
+            registered_table_nullable_types("t_null_literal_upd", 10).await;
+
+        assert_eq!(
+            execute_sql(
+                &ctx,
+                Arc::clone(&storage),
+                &root,
+                "UPDATE t_null_literal_upd SET score = 123 WHERE id = 1",
+            )
+            .await
+            .unwrap(),
+            1,
+            "UPDATE must report 1 row affected"
+        );
+
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT score FROM t_null_literal_upd WHERE id = 1").await,
+            123,
+            "nullable Int64 column must hold the assigned non-null literal"
+        );
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT COUNT(*) FROM t_null_literal_upd").await,
+            10,
+            "UPDATE must not change the row count"
         );
     }
 

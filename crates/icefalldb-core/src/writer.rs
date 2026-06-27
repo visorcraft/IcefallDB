@@ -2213,11 +2213,14 @@ impl Writer {
         }
 
         // Defensive schema check: the patch batch must match the writer's schema
-        // (names, types, and nullability) before any files are written.
-        if !schema_equal_ignoring_metadata(rows.schema().as_ref(), &self.arrow_schema) {
+        // by field names and data types before any files are written. Nullability
+        // is intentionally ignored: DataFusion projections of non-null literals
+        // may report a non-nullable output field even when the target column is
+        // nullable.
+        if !schema_equal_names_and_types(rows.schema().as_ref(), &self.arrow_schema) {
             return Err(IcefallDBError::SchemaMismatch {
                 column: "schema".into(),
-                expected: "match writer schema".into(),
+                expected: "match writer schema names and types".into(),
                 path: self.table.clone(),
             });
         }
@@ -5397,6 +5400,22 @@ fn schema_equal_ignoring_metadata(a: &ArrowSchema, b: &ArrowSchema) -> bool {
             && af.data_type() == bf.data_type()
             && af.is_nullable() == bf.is_nullable()
     })
+}
+
+/// Returns true if two Arrow schemas have the same number, names, and data
+/// types of fields, ignoring nullability and any additional metadata.
+///
+/// This is used for UPDATE patch batches: DataFusion projections of non-null
+/// literals produce non-nullable output fields even when the target column is
+/// nullable, so nullability must not be part of the defensive check.
+fn schema_equal_names_and_types(a: &ArrowSchema, b: &ArrowSchema) -> bool {
+    if a.fields().len() != b.fields().len() {
+        return false;
+    }
+    a.fields()
+        .iter()
+        .zip(b.fields().iter())
+        .all(|(af, bf)| af.name() == bf.name() && af.data_type() == bf.data_type())
 }
 
 fn arrow_type(type_str: &str, column: &str, path: &str) -> Result<DataType> {
