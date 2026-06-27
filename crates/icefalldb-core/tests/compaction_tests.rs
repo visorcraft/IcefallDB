@@ -365,6 +365,10 @@ async fn test_compaction_reduces_file_count() {
 #[tokio::test]
 async fn test_compaction_no_op_on_empty_table() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    Writer::create(Arc::clone(&storage), "empty", make_int_schema(10))
+        .await
+        .unwrap();
+
     let result = Compactor::new(storage.as_ref(), "empty")
         .compact()
         .await
@@ -374,6 +378,17 @@ async fn test_compaction_no_op_on_empty_table() {
     assert_eq!(result.output_row_groups, 0);
     assert_eq!(result.input_rows, 0);
     assert_eq!(result.output_rows, 0);
+}
+
+#[tokio::test]
+async fn test_compaction_fails_on_missing_table() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let err = Compactor::new(storage.as_ref(), "missing")
+        .compact()
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, IcefallDBError::TableNotFound(_)), "{err}");
 }
 
 #[tokio::test]
@@ -771,7 +786,7 @@ async fn test_compaction_intent_rollback() {
 }
 
 #[tokio::test]
-async fn test_compaction_repairs_missing_pointer() {
+async fn test_compaction_fails_when_manifest_pointer_missing() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let schema = make_int_schema(100);
     let mut writer = Writer::new(Arc::clone(&storage), "products", schema)
@@ -783,32 +798,16 @@ async fn test_compaction_repairs_missing_pointer() {
         .await
         .unwrap();
     writer.commit().await.unwrap();
-    writer
-        .insert_batch(make_batch((11..=20).collect()))
-        .await
-        .unwrap();
-    writer.commit().await.unwrap();
-
-    let before_manifest = read_latest_manifest(&storage, "products").await;
-    let before_seq = before_manifest.sequence;
 
     // Delete the manifest pointer but leave the snapshots intact.
     storage.delete("products/_manifest.json").await.unwrap();
 
-    let result = Compactor::new(storage.as_ref(), "products")
+    let err = Compactor::new(storage.as_ref(), "products")
         .compact()
         .await
-        .unwrap();
-    assert_eq!(result.input_row_groups, 2);
-    assert_eq!(result.output_row_groups, 1);
+        .unwrap_err();
 
-    // The pointer must be restored and point to a new compacted snapshot.
-    let pointer_data = storage.read("products/_manifest.json").await.unwrap();
-    let pointer: serde_json::Value = serde_json::from_slice(&pointer_data).unwrap();
-    assert!(pointer["latest"].as_u64().unwrap() > before_seq);
-
-    let manifest = read_latest_manifest(&storage, "products").await;
-    assert_eq!(manifest.row_groups.len(), 1);
+    assert!(matches!(err, IcefallDBError::TableNotFound(_)), "{err}");
 }
 
 #[tokio::test]

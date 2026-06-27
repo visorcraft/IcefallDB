@@ -50,8 +50,8 @@ pub use index::{
 };
 pub use reader::predicate_eval;
 pub use reader::{
-    build_scan_plan_at, list_snapshots, Literal, PlannedRowGroup, Predicate, Reader,
-    RowGroupStream, ScanPlan, SnapshotInfo,
+    build_scan_plan_at, list_snapshots, require_table_exists, Literal, PlannedRowGroup, Predicate,
+    Reader, RowGroupStream, ScanPlan, SnapshotInfo,
 };
 pub use recovery::{apply_committed_transactions, recover, RecoveryState};
 pub use rowid::{allocate_range, segment_ids, RowIdSegment};

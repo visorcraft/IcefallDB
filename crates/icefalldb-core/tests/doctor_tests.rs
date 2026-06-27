@@ -82,9 +82,8 @@ async fn test_doctor_no_op_on_healthy_table() {
 }
 
 #[tokio::test]
-async fn test_doctor_repairs_missing_pointer() {
+async fn test_doctor_fails_when_manifest_pointer_missing() {
     let (storage, table) = setup_committed_table().await;
-    let original_seq = read_latest_sequence(storage.as_ref(), &table).await;
 
     storage
         .delete(&format!("{}/_manifest.json", table))
@@ -92,18 +91,9 @@ async fn test_doctor_repairs_missing_pointer() {
         .unwrap();
 
     let doctor = Doctor::new(storage.as_ref(), &table);
-    let result = doctor.repair().await.unwrap();
+    let err = doctor.repair().await.unwrap_err();
 
-    assert!(result.repaired);
-    let pointer_action = result
-        .actions
-        .iter()
-        .find(|a| a.kind == ActionKind::PointerUpdated)
-        .expect("expected PointerUpdated action");
-    assert_eq!(pointer_action.path, "_manifest.json");
-
-    let restored_seq = read_latest_sequence(storage.as_ref(), &table).await;
-    assert_eq!(restored_seq, original_seq);
+    assert!(matches!(err, IcefallDBError::TableNotFound(_)), "{err}");
 }
 
 #[tokio::test]
@@ -500,16 +490,31 @@ async fn test_doctor_does_not_delete_committed_files_after_crash() {
 async fn test_doctor_diagnose_empty_table() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let table = "empty_table";
+    Writer::create(Arc::clone(&storage), table, make_schema())
+        .await
+        .unwrap();
 
     let doctor = Doctor::new(storage.as_ref(), table);
     let result = doctor.diagnose().await.unwrap();
 
     assert_eq!(result.table, table);
-    assert!(result.healthy);
-    assert_eq!(result.issues.len(), 1);
-    assert_eq!(result.issues[0].kind, DiagnosisKind::Info);
-    assert_eq!(result.issues[0].path, "_manifest.json");
-    assert_eq!(result.issues[0].detail, "empty table");
+    // An empty but initialized table has a manifest pointer of `{"latest": 0}`
+    // and no manifest snapshots, which doctor reports as an invalid pointer.
+    assert!(!result.healthy);
+    assert!(result
+        .issues
+        .iter()
+        .any(|i| i.kind == DiagnosisKind::InvalidPointer));
+}
+
+#[tokio::test]
+async fn test_doctor_diagnose_fails_on_missing_table() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+
+    let doctor = Doctor::new(storage.as_ref(), "missing");
+    let err = doctor.diagnose().await.unwrap_err();
+
+    assert!(matches!(err, IcefallDBError::TableNotFound(_)), "{err}");
 }
 
 #[tokio::test]
@@ -781,31 +786,17 @@ async fn test_doctor_diagnose_reports_missing_row_group_meta() {
 }
 
 #[tokio::test]
-async fn test_doctor_repair_missing_schema_is_unrepairable() {
+async fn test_doctor_repair_fails_when_schema_file_missing() {
     let (storage, table) = setup_committed_table().await;
     let manifest = read_latest_manifest(storage.as_ref(), &table).await;
     let schema_path = format!("{}/{}", table, Schema::filename(manifest.schema_id));
-    let meta_path = format!("{}/{}", table, manifest.row_groups[0].meta);
 
-    // Delete the schema file (but leave the schema pointer so repair proceeds
-    // past the existence check). `load_schema` will now return None.
+    // Delete the schema snapshot file but leave the pointers. The existence
+    // check now treats this as a missing table.
     storage.delete(&schema_path).await.unwrap();
-    // Also delete the meta sidecar so there is something to repair.
-    storage.delete(&meta_path).await.unwrap();
 
     let doctor = Doctor::new(storage.as_ref(), &table);
-    let result = doctor.repair().await.unwrap();
+    let err = doctor.repair().await.unwrap_err();
 
-    assert!(
-        !result.healthy,
-        "repair should be non-healthy when the schema is missing"
-    );
-    assert!(
-        result
-            .actions
-            .iter()
-            .any(|a| a.kind == ActionKind::Unrepairable && a.path == manifest.row_groups[0].meta),
-        "expected Unrepairable action for missing meta when schema is missing: {:?}",
-        result.actions
-    );
+    assert!(matches!(err, IcefallDBError::TableNotFound(_)), "{err}");
 }

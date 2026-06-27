@@ -58,7 +58,7 @@ pub enum IcefallDBError {
     RangeReadError { path: String, reason: String },
     #[error("table already exists: {0}")]
     TableAlreadyExists(String),
-    #[error("table not found: {0}")]
+    #[error("table '{0}' not found")]
     TableNotFound(String),
     #[error("tsv error at line {line}, column {column}, value {value}: {reason}")]
     TsvError {

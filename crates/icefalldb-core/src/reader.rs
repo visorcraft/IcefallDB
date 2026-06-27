@@ -1130,6 +1130,8 @@ async fn read_pointer_sequence(storage: &dyn Storage, table: &str) -> Option<u64
 /// physical row count, so the displayed count may undercount until the next
 /// checkpoint.
 pub async fn list_snapshots(storage: &dyn Storage, table: &str) -> Result<Vec<SnapshotInfo>> {
+    require_table_exists(storage, table).await?;
+
     let manifests_dir = format!("{}/_manifests", table);
     let entries = match storage.list(&manifests_dir).await {
         Ok(e) => e,
@@ -1191,6 +1193,39 @@ pub async fn list_snapshots(storage: &dyn Storage, table: &str) -> Result<Vec<Sn
         });
     }
     Ok(out)
+}
+
+/// Verify that `table` exists by checking that its schema pointer, schema file,
+/// and manifest pointer are all present.
+///
+/// This is the shared table-existence gate for maintenance commands. It returns
+/// [`IcefallDBError::TableNotFound`] when any of the required files is missing,
+/// including when `_schema.json` points to a schema snapshot that does not exist.
+pub async fn require_table_exists(storage: &dyn Storage, table: &str) -> Result<()> {
+    let schema_pointer_path = format!("{}/_schema.json", table);
+    let schema_id = match storage.exists(&schema_pointer_path).await? {
+        true => {
+            let data = storage.read(&schema_pointer_path).await?;
+            let pointer: serde_json::Value = serde_json::from_slice(&data)?;
+            pointer.get("latest").and_then(|v| v.as_u64())
+        }
+        false => None,
+    };
+    let Some(schema_id) = schema_id else {
+        return Err(IcefallDBError::TableNotFound(table.to_string()));
+    };
+
+    let schema_path = format!("{}/{}", table, Schema::filename(schema_id));
+    if !storage.exists(&schema_path).await? {
+        return Err(IcefallDBError::TableNotFound(table.to_string()));
+    }
+
+    let manifest_pointer_path = format!("{}/_manifest.json", table);
+    if !storage.exists(&manifest_pointer_path).await? {
+        return Err(IcefallDBError::TableNotFound(table.to_string()));
+    }
+
+    Ok(())
 }
 
 impl<'a> Reader<'a> {

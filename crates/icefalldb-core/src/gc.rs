@@ -46,6 +46,8 @@ impl<'a> GarbageCollector<'a> {
     /// Returns the list of deleted file paths and the sequence numbers of the
     /// retained snapshots.
     pub async fn run(&self) -> Result<GcResult> {
+        crate::reader::require_table_exists(self.storage, &self.table).await?;
+
         let lock_path = format!("{}/_write.lock", self.table);
         let _guard = self
             .storage

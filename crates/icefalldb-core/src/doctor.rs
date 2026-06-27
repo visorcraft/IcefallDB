@@ -163,6 +163,8 @@ impl<'a> Doctor<'a> {
     /// inspection. It reports stale intents, pointer problems, orphan files, and
     /// invalid manifest snapshots.
     pub async fn diagnose(&self) -> Result<DiagnosisResult> {
+        crate::reader::require_table_exists(self.storage, &self.table).await?;
+
         let mut issues = Vec::new();
 
         self.diagnose_intents(&mut issues).await?;
@@ -241,6 +243,8 @@ impl<'a> Doctor<'a> {
 
     /// Repair the table and return a description of all actions taken.
     pub async fn repair(&self) -> Result<RepairResult> {
+        crate::reader::require_table_exists(self.storage, &self.table).await?;
+
         let lock_path = format!("{}/_write.lock", self.table);
         let _guard = self
             .storage

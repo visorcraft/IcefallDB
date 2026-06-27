@@ -258,11 +258,11 @@ async fn test_cli_doctor_no_op_on_healthy_table() {
 }
 
 #[tokio::test]
-async fn test_cli_doctor_repair_flag_repairs_missing_pointer() {
+async fn test_cli_doctor_repair_fails_when_manifest_pointer_missing() {
     let tmp = tempfile::tempdir().unwrap();
     setup_table(tmp.path()).await;
 
-    // Delete the pointer to force a repair.
+    // Delete the manifest pointer. doctor now treats this as a missing table.
     std::fs::remove_file(table_path(tmp.path()).join("_manifest.json")).unwrap();
 
     let output = Command::new(icefalldb_bin())
@@ -273,21 +273,9 @@ async fn test_cli_doctor_repair_flag_repairs_missing_pointer() {
         .output()
         .unwrap();
 
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("PointerUpdated"));
-    assert!(stdout.contains("repaired"));
-
-    // Pointer should be restored.
-    let pointer: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(table_path(tmp.path()).join("_manifest.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(pointer["latest"].as_u64().unwrap(), 1);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("table 'products' not found"), "{stderr}");
 }
 
 #[tokio::test]

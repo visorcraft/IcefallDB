@@ -5,7 +5,9 @@ use icefalldb_core::metadata::{Column, Manifest, RowGroupEntry, Schema, Snapshot
 use icefalldb_core::storage::memory::MemoryStorage;
 use icefalldb_core::storage::Storage;
 use icefalldb_core::writer::Writer;
-use icefalldb_core::{dv_density, should_recompute, GarbageCollector, RECOMPUTE_DENSITY};
+use icefalldb_core::{
+    dv_density, should_recompute, GarbageCollector, IcefallDBError, RECOMPUTE_DENSITY,
+};
 use std::sync::Arc;
 
 fn make_schema() -> Schema {
@@ -333,14 +335,29 @@ async fn test_gc_removes_stale_intents_and_parts() {
 
 #[tokio::test]
 async fn test_gc_no_op_on_empty_table() {
-    let storage = MemoryStorage::new();
-    let result = GarbageCollector::new(&storage, "empty", 3)
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    Writer::create(Arc::clone(&storage), "empty", make_schema())
+        .await
+        .unwrap();
+
+    let result = GarbageCollector::new(storage.as_ref(), "empty", 3)
         .run()
         .await
         .unwrap();
 
     assert!(result.deleted.is_empty());
     assert!(result.retained_snapshots.is_empty());
+}
+
+#[tokio::test]
+async fn test_gc_fails_on_missing_table() {
+    let storage = MemoryStorage::new();
+    let err = GarbageCollector::new(&storage, "missing", 3)
+        .run()
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, IcefallDBError::TableNotFound(_)), "{err}");
 }
 
 async fn read_manifest(storage: &dyn Storage, table: &str, seq: u64) -> Manifest {
@@ -352,82 +369,28 @@ async fn read_manifest(storage: &dyn Storage, table: &str, seq: u64) -> Manifest
 }
 
 #[tokio::test]
-async fn test_gc_repairs_missing_pointer_and_cleans_orphans() {
+async fn test_gc_fails_when_manifest_pointer_missing() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let schema = make_schema();
     let mut writer = Writer::new(Arc::clone(&storage), "products", schema)
         .await
         .unwrap();
 
-    for i in 0..3 {
-        let start = i * 10 + 1;
-        writer
-            .insert_batch(make_batch((start..start + 10).collect()))
-            .await
-            .unwrap();
-        writer.commit().await.unwrap();
-    }
-
-    // Orphan row-group files that are not referenced by any manifest.
-    storage
-        .write("products/rg_orphan.parquet", b"orphan-data")
+    writer
+        .insert_batch(make_batch((1..=10).collect()))
         .await
         .unwrap();
-    storage
-        .write("products/rg_orphan.meta", b"orphan-meta")
-        .await
-        .unwrap();
-
-    // Leftover temporary manifest file.
-    storage
-        .write("products/_manifests/000000004.json.tmp", b"leftover")
-        .await
-        .unwrap();
+    writer.commit().await.unwrap();
 
     // Simulate a missing manifest pointer.
     storage.delete("products/_manifest.json").await.unwrap();
 
-    let result = GarbageCollector::new(storage.as_ref(), "products", 1)
+    let err = GarbageCollector::new(storage.as_ref(), "products", 1)
         .run()
         .await
-        .unwrap();
+        .unwrap_err();
 
-    // The highest valid sequence becomes the current sequence.
-    assert_eq!(result.retained_snapshots, vec![3]);
-
-    // The pointer is repaired atomically.
-    let pointer_data = storage.read("products/_manifest.json").await.unwrap();
-    let pointer: serde_json::Value = serde_json::from_slice(&pointer_data).unwrap();
-    assert_eq!(pointer["latest"], 3);
-
-    // Orphan files are removed.
-    assert!(!storage.exists("products/rg_orphan.parquet").await.unwrap());
-    assert!(!storage.exists("products/rg_orphan.meta").await.unwrap());
-
-    // Leftover manifest temp files are removed.
-    assert!(!storage
-        .exists("products/_manifests/000000004.json.tmp")
-        .await
-        .unwrap());
-
-    // Referenced files survive.
-    let latest = read_manifest(storage.as_ref(), "products", 3).await;
-    for entry in &latest.row_groups {
-        assert!(storage
-            .exists(&format!("products/{}", entry.data))
-            .await
-            .unwrap());
-        assert!(storage
-            .exists(&format!("products/{}", entry.meta))
-            .await
-            .unwrap());
-    }
-
-    assert_eq!(
-        count_manifests(storage.as_ref(), "products").await,
-        1,
-        "only the retained manifest should remain"
-    );
+    assert!(matches!(err, IcefallDBError::TableNotFound(_)), "{err}");
 }
 
 #[tokio::test]

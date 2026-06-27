@@ -602,6 +602,8 @@ impl<'a> Compactor<'a> {
         F: FnMut(u64) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        crate::reader::require_table_exists(self.storage, &self.table).await?;
+
         // Compaction reads and rewrites row groups. It has no encryption key
         // provider, so it cannot decode an encrypted table, and a rewrite would
         // drop the encryption + stats-redaction invariants. Refuse explicitly
