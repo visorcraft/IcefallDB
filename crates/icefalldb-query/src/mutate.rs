@@ -1082,6 +1082,50 @@ fn validate_update_targets(
     Ok(())
 }
 
+/// Replace untyped `NULL` literals in UPDATE SET assignments with typed nulls
+/// of the target column's Arrow data type.
+///
+/// A bare SQL `NULL` parses into `ScalarValue::Null`, which DataFusion projects
+/// as a `NullArray` (type `DataType::Null`). Building a patch fragment with that
+/// array fails when the target column has a concrete type such as `Int64`. This
+/// helper rewrites the literal to a typed null of the column's type so the
+/// projection produces a matching array.
+///
+/// Non-nullable targets are rejected with a schema error before any rows are
+/// read or written.
+fn coerce_update_null_literals(
+    table_name: &str,
+    schema: &arrow::datatypes::SchemaRef,
+    sets: &mut [(String, Expr)],
+) -> Result<()> {
+    use datafusion::common::ScalarValue;
+    for (col_name, expr) in sets.iter_mut() {
+        let is_untyped_null = matches!(expr, Expr::Literal(ScalarValue::Null, _));
+        if !is_untyped_null {
+            continue;
+        }
+        let field = schema.field_with_name(col_name).map_err(|_| {
+            QueryError::Other(format!(
+                "UPDATE SET target column '{col_name}' does not exist in table '{table_name}'"
+            ))
+        })?;
+        if !field.is_nullable() {
+            return Err(QueryError::Other(format!(
+                "UPDATE SET NULL cannot assign to non-nullable column '{col_name}' \
+                 in table '{table_name}'"
+            )));
+        }
+        let typed_null = ScalarValue::try_from(field.data_type()).map_err(|e| {
+            QueryError::Other(format!(
+                "UPDATE SET NULL cannot create typed null for column '{col_name}' \
+                 in table '{table_name}': {e}"
+            ))
+        })?;
+        *expr = Expr::Literal(typed_null, None);
+    }
+    Ok(())
+}
+
 /// Parse and validate the assignments in a `WHEN MATCHED THEN UPDATE SET`
 /// clause.
 ///
@@ -1917,6 +1961,9 @@ async fn execute_update_to_delta(
     // Validate all SET targets against the target schema before planning the
     // predicate or touching any rows.
     validate_update_targets(&table_name, &arrow_schema, &sets)?;
+    // Rewrite bare `NULL` literals to typed nulls of the target column's type;
+    // reject NULL assignments to non-nullable columns before reading/writing.
+    coerce_update_null_literals(&table_name, &arrow_schema, &mut sets)?;
 
     // Build the WHERE predicate.
     let predicate = build_predicate(ctx, &table_name, &update.selection).await?;
@@ -2390,7 +2437,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema};
     use datafusion::logical_expr::lit;
     use icefalldb_core::arrow_schema_to_icefalldb;
@@ -3267,6 +3314,67 @@ mod tests {
         (ctx, storage, root, tmp)
     }
 
+    /// Build a table with mixed nullable types for UPDATE NULL tests.
+    ///
+    /// Columns: `id` (Int64, non-nullable), `score` (Int64, nullable),
+    /// `name` (Utf8, nullable), `weight` (Float64, nullable),
+    /// `active` (Boolean, nullable). All rows are written in a single fragment.
+    ///
+    /// Returns `(SessionContext, Arc<dyn Storage>, table_root_string, TempDir)`.
+    async fn registered_table_nullable_types(
+        table_name: &str,
+        rows: usize,
+    ) -> (SessionContext, Arc<dyn Storage>, String, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()).unwrap());
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("score", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("weight", DataType::Float64, true),
+            Field::new("active", DataType::Boolean, true),
+        ]));
+        let mut mdb_schema = arrow_schema_to_icefalldb(Arc::clone(&arrow_schema));
+        mdb_schema.row_group_target_rows = rows.max(1);
+
+        let ids: Vec<i64> = (0..rows as i64).collect();
+        let scores: Vec<Option<i64>> = ids.iter().map(|i| Some(i * 10)).collect();
+        let names: Vec<Option<String>> = ids.iter().map(|i| Some(format!("row-{i}"))).collect();
+        let weights: Vec<Option<f64>> = ids.iter().map(|i| Some(*i as f64 * 1.5)).collect();
+        let actives: Vec<Option<bool>> = ids.iter().map(|i| Some(i % 2 == 0)).collect();
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(scores)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(Float64Array::from(weights)),
+                Arc::new(BooleanArray::from(actives)),
+            ],
+        )
+        .unwrap();
+
+        let mut writer = Writer::create(Arc::clone(&storage), table_name, mdb_schema)
+            .await
+            .unwrap();
+        writer.insert_batch(batch).await.unwrap();
+        writer.commit().await.unwrap();
+
+        let config = mutate_provider_config();
+        let provider = Arc::new(
+            IcefallDBTableProvider::new(Arc::clone(&storage), table_name, config)
+                .await
+                .unwrap(),
+        );
+        let ctx = icefalldb_session(1, 1024);
+        ctx.register_table(table_name, provider).unwrap();
+
+        let root = table_name.to_string();
+        (ctx, storage, root, tmp)
+    }
+
     /// A table sorted on `id` needs **no secondary index** — a point
     /// UPDATE/DELETE locates via the proven, stats-pruned scan path and produces
     /// results byte-equal to the same ops on an `id`-indexed copy. (Per the design
@@ -3561,6 +3669,128 @@ mod tests {
         assert!(
             !updated_index.lookup("50").contains(&5u64),
             "post-update: index entry for old value v=50 must no longer map to row_id=5"
+        );
+    }
+
+    /// End-to-end UPDATE: setting nullable int, string, float, and bool columns
+    /// to bare SQL `NULL` succeeds and leaves the rows with NULL values.
+    #[tokio::test]
+    async fn end_to_end_sql_update_nullable_columns_to_null() {
+        let (ctx, storage, root, _tmp) = registered_table_nullable_types("t_null_upd", 10).await;
+
+        assert_eq!(
+            execute_sql(
+                &ctx,
+                Arc::clone(&storage),
+                &root,
+                "UPDATE t_null_upd SET score = NULL WHERE id = 1",
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            execute_sql(
+                &ctx,
+                Arc::clone(&storage),
+                &root,
+                "UPDATE t_null_upd SET name = NULL WHERE id = 2",
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            execute_sql(
+                &ctx,
+                Arc::clone(&storage),
+                &root,
+                "UPDATE t_null_upd SET weight = NULL WHERE id = 3",
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            execute_sql(
+                &ctx,
+                Arc::clone(&storage),
+                &root,
+                "UPDATE t_null_upd SET active = NULL WHERE id = 4",
+            )
+            .await
+            .unwrap(),
+            1
+        );
+
+        assert_eq!(
+            scalar_i64(
+                &ctx,
+                "SELECT COUNT(*) FROM t_null_upd WHERE id = 1 AND score IS NULL"
+            )
+            .await,
+            1,
+            "nullable Int64 column must be set to NULL"
+        );
+        assert_eq!(
+            scalar_i64(
+                &ctx,
+                "SELECT COUNT(*) FROM t_null_upd WHERE id = 2 AND name IS NULL"
+            )
+            .await,
+            1,
+            "nullable Utf8 column must be set to NULL"
+        );
+        assert_eq!(
+            scalar_i64(
+                &ctx,
+                "SELECT COUNT(*) FROM t_null_upd WHERE id = 3 AND weight IS NULL"
+            )
+            .await,
+            1,
+            "nullable Float64 column must be set to NULL"
+        );
+        assert_eq!(
+            scalar_i64(
+                &ctx,
+                "SELECT COUNT(*) FROM t_null_upd WHERE id = 4 AND active IS NULL"
+            )
+            .await,
+            1,
+            "nullable Boolean column must be set to NULL"
+        );
+    }
+
+    /// End-to-end UPDATE: assigning `NULL` to a non-nullable column is rejected
+    /// before any rows are written, leaving the table unchanged.
+    #[tokio::test]
+    async fn end_to_end_sql_update_non_nullable_to_null_fails() {
+        let (ctx, storage, root, _tmp) = registered_table_two_cols("t_non_null_upd", 10).await;
+
+        let err = execute_sql(
+            &ctx,
+            Arc::clone(&storage),
+            &root,
+            "UPDATE t_non_null_upd SET v = NULL WHERE id = 1",
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("non-nullable"),
+            "expected non-nullable column error, got: {msg}"
+        );
+
+        // Table must be unchanged: v for id=1 is still 10 and all rows remain.
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT v FROM t_non_null_upd WHERE id = 1").await,
+            10,
+            "rejected UPDATE must not modify the row"
+        );
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT COUNT(*) FROM t_non_null_upd").await,
+            10,
+            "rejected UPDATE must not change the row count"
         );
     }
 

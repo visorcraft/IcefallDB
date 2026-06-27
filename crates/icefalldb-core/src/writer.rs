@@ -2212,6 +2212,16 @@ impl Writer {
             ));
         }
 
+        // Defensive schema check: the patch batch must match the writer's schema
+        // (names, types, and nullability) before any files are written.
+        if !schema_equal_ignoring_metadata(rows.schema().as_ref(), &self.arrow_schema) {
+            return Err(IcefallDBError::SchemaMismatch {
+                column: "schema".into(),
+                expected: "match writer schema".into(),
+                path: self.table.clone(),
+            });
+        }
+
         // ── Step 1: sort rows+locs by row_id ────────────────────────────────
         let mut order: Vec<usize> = (0..locs.len()).collect();
         order.sort_unstable_by_key(|&i| locs[i].row_id);
