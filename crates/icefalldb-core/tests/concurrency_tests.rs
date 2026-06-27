@@ -5,6 +5,7 @@ use icefalldb_core::storage::memory::MemoryStorage;
 use icefalldb_core::storage::{LockGuard, Storage};
 use icefalldb_core::writer::Writer;
 use icefalldb_core::Result;
+use parquet::arrow::arrow_writer::ArrowWriter;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -189,6 +190,137 @@ async fn test_writer_lock_held_through_manifest_publication() {
     assert!(commit_result.is_ok(), "commit failed: {:?}", commit_result);
 
     // The table must reflect the committed rows.
+    let pointer: serde_json::Value = serde_json::from_slice(
+        &storage
+            .read(&format!("{}/_manifest.json", table))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pointer.get("latest").and_then(|v| v.as_u64()), Some(1));
+}
+
+/// Writes a single-row-group Parquet file compatible with the test schema.
+fn write_parquet_file(path: &std::path::Path, ids: Vec<i64>) {
+    let file = std::fs::File::create(path).unwrap();
+    let schema = ArrowSchema::new(vec![Field::new("id", DataType::Int64, false)]);
+    let mut writer = ArrowWriter::try_new(file, Arc::new(schema), None).unwrap();
+    let batch = make_int_batch(ids);
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+/// Verifies that `Writer::replace` keeps the exclusive writer lock held until
+/// the manifest pointer swap completes.
+#[tokio::test]
+async fn test_writer_replace_lock_held_through_manifest_publication() {
+    let (storage, publish_rx, release_tx) = ManifestPublishBlockingStorage::new();
+    let storage: Arc<dyn Storage> = Arc::new(storage);
+    let table = "products";
+    let schema = make_int_schema(10);
+
+    let mut writer = Writer::new(Arc::clone(&storage), table, schema)
+        .await
+        .unwrap();
+    writer
+        .insert_batch(make_int_batch(vec![1, 2, 3]))
+        .await
+        .unwrap();
+
+    let replace = tokio::spawn(async move { writer.replace().await });
+
+    // Wait until the replace is about to swap the manifest pointer.
+    publish_rx.await.unwrap();
+
+    // The lock must still be held: a concurrent lock attempt times out.
+    let storage2 = Arc::clone(&storage);
+    let lock_attempt = tokio::spawn(async move {
+        storage2
+            .lock_exclusive(&format!("{}/_write.lock", table), Duration::from_millis(50))
+            .await
+    });
+    let lock_result = tokio::time::timeout(Duration::from_secs(2), lock_attempt)
+        .await
+        .expect("lock attempt task should finish quickly")
+        .unwrap();
+    assert!(
+        lock_result.is_err(),
+        "second writer should not acquire the lock while replace is mid-commit"
+    );
+
+    // Allow the replace to finish and verify success.
+    let _ = release_tx.send(());
+    let replace_result = tokio::time::timeout(Duration::from_secs(5), replace)
+        .await
+        .expect("replace should complete after release")
+        .unwrap();
+    assert!(
+        replace_result.is_ok(),
+        "replace failed: {:?}",
+        replace_result
+    );
+
+    let pointer: serde_json::Value = serde_json::from_slice(
+        &storage
+            .read(&format!("{}/_manifest.json", table))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pointer.get("latest").and_then(|v| v.as_u64()), Some(1));
+}
+
+/// Verifies that `Writer::insert_parquet` keeps the exclusive writer lock held
+/// until the manifest pointer swap completes.
+#[tokio::test]
+async fn test_writer_insert_parquet_lock_held_through_manifest_publication() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parquet_path = tmp.path().join("source.parquet");
+    write_parquet_file(&parquet_path, vec![7, 8, 9]);
+
+    let (storage, publish_rx, release_tx) = ManifestPublishBlockingStorage::new();
+    let storage: Arc<dyn Storage> = Arc::new(storage);
+    let table = "products";
+    let schema = make_int_schema(10);
+
+    let mut writer = Writer::new(Arc::clone(&storage), table, schema)
+        .await
+        .unwrap();
+
+    let source_path = parquet_path.to_str().unwrap().to_string();
+    let insert = tokio::spawn(async move { writer.insert_parquet(&source_path).await.map(|_| ()) });
+
+    // Wait until the parquet insert is about to swap the manifest pointer.
+    publish_rx.await.unwrap();
+
+    // The lock must still be held: a concurrent lock attempt times out.
+    let storage2 = Arc::clone(&storage);
+    let lock_attempt = tokio::spawn(async move {
+        storage2
+            .lock_exclusive(&format!("{}/_write.lock", table), Duration::from_millis(50))
+            .await
+    });
+    let lock_result = tokio::time::timeout(Duration::from_secs(2), lock_attempt)
+        .await
+        .expect("lock attempt task should finish quickly")
+        .unwrap();
+    assert!(
+        lock_result.is_err(),
+        "second writer should not acquire the lock while insert_parquet is mid-commit"
+    );
+
+    // Allow the parquet insert to finish and verify success.
+    let _ = release_tx.send(());
+    let insert_result = tokio::time::timeout(Duration::from_secs(5), insert)
+        .await
+        .expect("insert_parquet should complete after release")
+        .unwrap();
+    assert!(
+        insert_result.is_ok(),
+        "insert_parquet failed: {:?}",
+        insert_result
+    );
+
     let pointer: serde_json::Value = serde_json::from_slice(
         &storage
             .read(&format!("{}/_manifest.json", table))
