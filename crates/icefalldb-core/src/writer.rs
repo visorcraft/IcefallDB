@@ -834,14 +834,19 @@ impl Writer {
             meta_checksum: String::new(),
         };
 
-        // Acquire the writer lock unless the caller already holds it.
-        if !self.assume_lock_held {
+        // Acquire the writer lock unless the caller already holds it. Keep the
+        // guard alive in the outer function scope until the commit returns so
+        // the manifest pointer swap is covered by the exclusive lock.
+        let _lock: Option<Box<dyn crate::storage::LockGuard>> = if !self.assume_lock_held {
             let lock_path = format!("{}/_write.lock", self.table);
-            let _lock = self
-                .storage
-                .lock_exclusive(&lock_path, self.lock_timeout)
-                .await?;
-        }
+            Some(
+                self.storage
+                    .lock_exclusive(&lock_path, self.lock_timeout)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         // Check whether an identical row group is already committed; if so,
         // reference the existing data file instead of copying it again.
@@ -1584,14 +1589,19 @@ impl Writer {
         // Serialize all commits through an exclusive lock acquired at the very
         // start of mutation. Time out using the configured timeout so a stuck
         // lock does not hang the writer forever. If the caller already holds
-        // the lock, skip re-acquisition.
-        if !self.assume_lock_held {
+        // the lock, skip re-acquisition. Keep the guard alive in the outer
+        // function scope until the commit returns so the manifest pointer swap
+        // is covered by the exclusive lock.
+        let _lock: Option<Box<dyn crate::storage::LockGuard>> = if !self.assume_lock_held {
             let lock_path = format!("{}/_write.lock", self.table);
-            let _lock = self
-                .storage
-                .lock_exclusive(&lock_path, self.lock_timeout)
-                .await?;
-        }
+            Some(
+                self.storage
+                    .lock_exclusive(&lock_path, self.lock_timeout)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         let (_, current_manifest) = self.load_current_manifest().await?;
         let mut rollback = RollbackInfo::default();
@@ -1654,13 +1664,18 @@ impl Writer {
     /// return zero rows.
     pub async fn replace(&mut self) -> Result<CommitDelta> {
         // If the caller already holds the writer lock, skip re-acquisition.
-        if !self.assume_lock_held {
+        // Keep the guard alive in the outer function scope until the replace
+        // returns so the manifest pointer swap is covered by the exclusive lock.
+        let _lock: Option<Box<dyn crate::storage::LockGuard>> = if !self.assume_lock_held {
             let lock_path = format!("{}/_write.lock", self.table);
-            let _lock = self
-                .storage
-                .lock_exclusive(&lock_path, self.lock_timeout)
-                .await?;
-        }
+            Some(
+                self.storage
+                    .lock_exclusive(&lock_path, self.lock_timeout)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         let (_, current_manifest) = self.load_current_manifest().await?;
         let mut rollback = RollbackInfo::default();
