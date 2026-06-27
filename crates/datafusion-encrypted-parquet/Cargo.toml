@@ -3,20 +3,23 @@ name = "datafusion-encrypted-parquet"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Turnkey Parquet Modular Encryption for DataFusion's ParquetFormat / ParquetSource"
+
+# Declared only to enable its `parquet_encryption` feature (see [features]);
+# there is no direct `use`, so cargo-machete would otherwise flag it.
+[package.metadata.cargo-machete]
+ignored = ["datafusion-datasource-parquet"]
 
 [dependencies]
 datafusion = { version = "54.0.0", default-features = false, features = ["parquet"] }
 datafusion-common = "54.0.0"
 datafusion-execution = "54.0.0"
-datafusion-datasource = "54.0.0"
 datafusion-datasource-parquet = "54.0.0"
 parquet = { version = "58", default-features = false, features = ["arrow"] }
 arrow = "58"
 object_store = "0.13"
 async-trait = "0.1"
-thiserror = "2"
-tracing = "0.1"
 base64 = "0.22"
 
 [features]

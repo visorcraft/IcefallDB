@@ -282,6 +282,10 @@ Full user documentation lives in [`docs/`](docs/):
 
 ---
 
-## License
+## License & credits
 
-IcefallDB is dual-licensed under MIT or Apache-2.0.
+IcefallDB is dual-licensed under MIT or Apache-2.0 (see [LICENSE-MIT](LICENSE-MIT)
+and [LICENSE-APACHE](LICENSE-APACHE)). It builds on the open-source projects
+acknowledged in [CREDITS.md](CREDITS.md); the full, versioned license inventory of
+every bundled dependency is in
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

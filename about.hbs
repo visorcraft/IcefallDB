@@ -1,0 +1,30 @@
+# Third-Party Licenses
+
+IcefallDB is built on the Rust crate ecosystem. This file inventories every
+third-party crate compiled into the shipped artifacts, grouped by license, with
+the full text of each distinct license. It is generated from `Cargo.lock` with
+[`cargo-about`](https://github.com/EmbarkStudios/cargo-about):
+
+```sh
+cargo about generate about.hbs > THIRD_PARTY_LICENSES.md
+```
+
+{{#each overview}}
+- **{{name}}** ({{id}}): {{count}} crate(s)
+{{/each}}
+
+---
+
+{{#each licenses}}
+## {{name}}
+
+Used by:
+{{#each used_by}}
+- [{{crate.name}} {{crate.version}}]({{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}})
+{{/each}}
+
+```
+{{text}}
+```
+
+{{/each}}
