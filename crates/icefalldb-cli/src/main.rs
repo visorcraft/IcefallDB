@@ -1617,6 +1617,21 @@ async fn run_query(
              the server does not decrypt encrypted tables"
         );
     }
+    // The server cannot serve encrypted tables. Reject up front when the local
+    // path resolves to an encrypted table (a table directory, or any `--table`
+    // under a database directory, carrying an `_encryption.json` marker).
+    if server.is_some() {
+        let encrypted = path.join("_encryption.json").is_file()
+            || extra_tables
+                .iter()
+                .any(|t| path.join(t).join("_encryption.json").is_file());
+        if encrypted {
+            anyhow::bail!(
+                "cannot query an encrypted table via --server; the server does not \
+                 decrypt encrypted tables. Query it locally instead."
+            );
+        }
+    }
 
     // OPTIONAL daemon path: route to a running server (which pays open once). The
     // default (no --server) standalone path below is unchanged.

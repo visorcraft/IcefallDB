@@ -71,13 +71,27 @@ impl Server {
 
         // Discover tables using the central catalog or legacy directory scan.
         let tables = list_tables(Arc::clone(&storage)).await?;
+        let mut registered = Vec::with_capacity(tables.len());
         for table in &tables {
+            // The server has no encryption key provider and keeps a plaintext
+            // result cache, so it cannot serve encrypted tables. Skip them: a
+            // query that references one fails cleanly ("table not found")
+            // instead of leaking decrypted rows through the cache.
+            if storage.exists(&format!("{table}/_encryption.json")).await? {
+                eprintln!(
+                    "icefalldb-server: skipping encrypted table '{table}' \
+                     (encrypted tables are not served over HTTP)"
+                );
+                continue;
+            }
             let provider = IcefallDBTableProvider::new(Arc::clone(&storage), table, config)
                 .await
                 .map_err(|e| ServerError::Internal(format!("table {table}: {e}")))?;
             ctx.register_table(table, Arc::new(provider))
                 .map_err(|e| ServerError::Internal(format!("register {table}: {e}")))?;
+            registered.push(table.clone());
         }
+        let tables = registered;
 
         let wal = Arc::new(Wal::open(Arc::clone(&storage)).await?);
         icefalldb_core::recovery::apply_committed_transactions(Arc::clone(&storage)).await?;

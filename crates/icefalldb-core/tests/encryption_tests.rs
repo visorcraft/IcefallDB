@@ -139,6 +139,31 @@ async fn write_encrypted_round_trip() {
 }
 
 #[tokio::test]
+async fn rejects_encrypted_partition_column() {
+    // Partition values are stored in plaintext (for pruning), so partitioning by
+    // an encrypted column would leak it. Creating such a table must be rejected.
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let mut schema = make_two_col_schema();
+    schema.partition_by = Some(vec!["ssn".to_string()]);
+    let cfg = EncryptionWriteConfig::new(sample_key_set(FOOTER_KEY));
+    let result = Writer::create_with_full(
+        Arc::clone(&storage),
+        "events",
+        schema,
+        WriterOptionsFull::new().with_encryption(cfg),
+    )
+    .await;
+    let msg = match result {
+        Ok(_) => panic!("partitioning by an encrypted column must be rejected"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("partition column") && msg.contains("cannot be encrypted"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn write_encrypted_wrong_key_fails() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let keys = sample_key_set(FOOTER_KEY);

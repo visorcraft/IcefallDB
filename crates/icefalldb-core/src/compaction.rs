@@ -602,6 +602,20 @@ impl<'a> Compactor<'a> {
         F: FnMut(u64) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        // Compaction reads and rewrites row groups. It has no encryption key
+        // provider, so it cannot decode an encrypted table, and a rewrite would
+        // drop the encryption + stats-redaction invariants. Refuse explicitly
+        // rather than fail with an opaque decode error or rewrite unsafely.
+        if self
+            .storage
+            .exists(&format!("{}/_encryption.json", self.table))
+            .await?
+        {
+            return Err(IcefallDBError::Encryption(format!(
+                "compaction/optimize of encrypted table '{}' is not supported",
+                self.table
+            )));
+        }
         for _ in 0..MAX_COMMIT_ATTEMPTS {
             match self.compact_attempt(&mut before_commit).await? {
                 AttemptOutcome::Committed(result) => return Ok(result),

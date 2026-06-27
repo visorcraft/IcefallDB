@@ -524,6 +524,26 @@ impl Writer {
             });
         }
 
+        // Encrypted partition columns are rejected: partition values are stored
+        // in plaintext (in manifests, used for pruning), which would leak the
+        // very values the encryption is meant to protect.
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = &options.encryption {
+            if let Some(parts) = &schema.partition_by {
+                for p in parts {
+                    let encrypted =
+                        enc.encrypted_columns.is_empty() || enc.encrypted_columns.contains(p);
+                    if encrypted {
+                        return Err(IcefallDBError::Encryption(format!(
+                            "partition column '{p}' cannot be encrypted: partition values are \
+                             stored in plaintext for pruning. Partition by a non-encrypted \
+                             column, or do not encrypt '{p}'."
+                        )));
+                    }
+                }
+            }
+        }
+
         let arrow_schema = arrow_schema_from_icefalldb(&schema, table)?;
         let lock_path = format!("{}/_write.lock", table);
 
@@ -1112,6 +1132,25 @@ impl Writer {
     #[cfg(not(feature = "encryption"))]
     fn is_column_encrypted(&self, _name: &str) -> bool {
         false
+    }
+
+    /// Drop plaintext statistics for encrypted columns from a `RowGroupMeta`
+    /// and recompute its checksum, so the persisted `.meta` (and any checkpoint
+    /// that copies it) cannot leak the protected values. No-op for plaintext
+    /// tables. Applied by every path that writes a `RowGroupMeta` from a
+    /// plaintext batch (insert, and UPDATE/MERGE patch fragments).
+    #[cfg(feature = "encryption")]
+    fn redact_encrypted_meta(&self, meta: &mut RowGroupMeta, parquet_bytes: &[u8]) -> Result<()> {
+        if self.encryption.is_some() {
+            meta.columns
+                .retain(|name, _| !self.is_column_encrypted(name));
+            meta.compute_checksum(parquet_bytes)?;
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "encryption"))]
+    fn redact_encrypted_meta(&self, _meta: &mut RowGroupMeta, _parquet_bytes: &[u8]) -> Result<()> {
+        Ok(())
     }
 
     fn derive_footer_stats(
@@ -2255,7 +2294,7 @@ impl Writer {
             ids: sorted_row_ids.clone(),
         };
 
-        let patch_meta = compute_row_group_meta(
+        let mut patch_meta = compute_row_group_meta(
             &patch_rg_id,
             self.schema.schema_id,
             &sorted_rows,
@@ -2264,6 +2303,8 @@ impl Writer {
             &self.table,
             std::slice::from_ref(&patch_row_id_seg),
         )?;
+        // Redact encrypted-column stats from the patch fragment metadata.
+        self.redact_encrypted_meta(&mut patch_meta, &parquet_bytes)?;
 
         // Write .part files.
         let parquet_part = format!(
@@ -2964,7 +3005,7 @@ impl Writer {
             let patch_row_id_seg = crate::rowid::RowIdSegment::Sorted {
                 ids: sorted_matched_row_ids.clone(),
             };
-            let patch_meta = compute_row_group_meta(
+            let mut patch_meta = compute_row_group_meta(
                 &patch_rg_id,
                 self.schema.schema_id,
                 sorted_rows,
@@ -2973,6 +3014,7 @@ impl Writer {
                 &self.table,
                 std::slice::from_ref(&patch_row_id_seg),
             )?;
+            self.redact_encrypted_meta(&mut patch_meta, &parquet_bytes)?;
             Some((
                 format!("{}.parquet", patch_rg_id),
                 format!("{}.meta", patch_rg_id),
@@ -3025,7 +3067,7 @@ impl Writer {
             let insert_seg = insert_row_id_seg
                 .clone()
                 .expect("insert row-id segment present");
-            let insert_meta = compute_row_group_meta(
+            let mut insert_meta = compute_row_group_meta(
                 &insert_rg_id,
                 self.schema.schema_id,
                 &insert_rows,
@@ -3034,6 +3076,7 @@ impl Writer {
                 &self.table,
                 std::slice::from_ref(&insert_seg),
             )?;
+            self.redact_encrypted_meta(&mut insert_meta, &parquet_bytes)?;
             Some((
                 format!("{}.parquet", insert_rg_id),
                 format!("{}.meta", insert_rg_id),
@@ -4339,15 +4382,7 @@ impl Writer {
             &self.table,
             row_ids,
         )?;
-        // Drop plaintext statistics for encrypted columns so the `.meta` (and the
-        // checkpoint, which reads it) cannot leak their min/max/null values, then
-        // recompute the meta checksum over the redacted stats.
-        #[cfg(feature = "encryption")]
-        if self.encryption.is_some() {
-            meta.columns
-                .retain(|name, _| !self.is_column_encrypted(name));
-            meta.compute_checksum(&parquet_bytes)?;
-        }
+        self.redact_encrypted_meta(&mut meta, &parquet_bytes)?;
         let meta_json = serde_json::to_vec(&meta)?;
         self.storage.write(&meta_part_path, &meta_json).await?;
 

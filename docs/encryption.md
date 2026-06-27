@@ -142,3 +142,9 @@ extension (turn it off with `--no-default-features` for a smaller build).
 - **Mutations** (`DELETE` / `UPDATE` / `MERGE`) on encrypted tables are not yet
   supported through the CLI or Python; encrypted tables are read-only there for
   now.
+- **Compaction** (`compact` / `optimize`) is rejected on encrypted tables: it
+  cannot decrypt and rewrite them. They are stored compactly at write time.
+- **The HTTP server** does not serve encrypted tables (it has no key provider);
+  it skips them at startup. Query encrypted tables locally instead.
+- **Partition columns cannot be encrypted**, because partition values are stored
+  in plaintext for pruning. Partition by a non-encrypted column.

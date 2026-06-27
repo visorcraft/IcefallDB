@@ -125,40 +125,67 @@ fn encrypted_stats_not_leaked_in_plaintext_sidecars() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let table_dir = db.join("t");
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&table_dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .collect();
-    let checkpoints = table_dir.join("_checkpoints");
-    if checkpoints.is_dir() {
-        files.extend(
-            std::fs::read_dir(&checkpoints)
-                .unwrap()
-                .filter_map(|e| e.ok().map(|e| e.path())),
-        );
-    }
-    // No `.agg` sidecar must exist, and no `.meta`/checkpoint may contain the
-    // encrypted column's values (min/max/sum statistics).
-    for f in files {
-        let name = f.to_string_lossy().to_string();
-        assert!(
-            !name.ends_with(".agg"),
-            "encrypted table wrote an .agg sidecar"
-        );
-        let is_meta = name.ends_with(".meta");
-        let is_checkpoint = f
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|n| n == "_checkpoints")
-            .unwrap_or(false);
-        if is_meta || is_checkpoint {
-            let bytes = std::fs::read(&f).unwrap_or_default();
+    // Recursively scan EVERY file under the table directory (data, .meta, .agg,
+    // _checkpoints/, _manifests/, _manifest.json, ...). The only file allowed to
+    // hold the encrypted column's bytes is the encrypted `.parquet` itself; no
+    // plaintext metadata sidecar may contain the values, and no `.agg` may exist.
+    let mut stack = vec![db.join("t")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = path.to_string_lossy().to_string();
+            assert!(
+                !name.ends_with(".agg"),
+                "encrypted table wrote an .agg sidecar: {name}"
+            );
+            if name.ends_with(".parquet") {
+                continue; // the encrypted data file is allowed to hold the bytes
+            }
+            let bytes = std::fs::read(&path).unwrap_or_default();
             assert!(
                 !contains(&bytes, b"987654321") && !contains(&bytes, b"123456789"),
-                "encrypted column value leaked into plaintext sidecar {name}"
+                "encrypted column value leaked into plaintext metadata file {name}"
             );
         }
+    }
+}
+
+#[test]
+fn rejects_compaction_of_encrypted_table() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("db");
+    let tsv = tmp.path().join("t.tsv");
+    std::fs::write(&tsv, "id\tsecret\n1\t42\n").unwrap();
+    let key = "000102030405060708090a0b0c0d0e0f";
+    let imp = Command::new(bin())
+        .args([
+            "import",
+            db.to_str().unwrap(),
+            "t",
+            tsv.to_str().unwrap(),
+            "--encrypt",
+        ])
+        .env("ICEFALLDB_KEY_T_V1", key)
+        .output()
+        .unwrap();
+    assert!(imp.status.success());
+
+    for cmd in [["compact"], ["optimize"]] {
+        let out = Command::new(bin())
+            .args([cmd[0], db.to_str().unwrap(), "t"])
+            .env("ICEFALLDB_KEY_T_V1", key)
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "{} of an encrypted table should be rejected",
+            cmd[0]
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not supported"));
     }
 }
 
