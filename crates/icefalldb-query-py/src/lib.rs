@@ -74,6 +74,11 @@ pub struct IcefallDBConnection {
     /// When `true`, this connection is pinned to a historical snapshot and
     /// must not be used for mutations (`mutate`/`mutate_batch` raise an error).
     read_only: bool,
+    /// Historical snapshot sequence this connection is pinned to, if any.
+    /// Live connections use `None`.
+    snapshot: Option<u64>,
+    /// Key file path passed at construction, used to refresh encrypted providers.
+    key_file: Option<String>,
 }
 
 /// Minimal HTTP/1.1 POST over std TCP (no HTTP-client dependency). Returns the
@@ -241,6 +246,107 @@ async fn open_encrypted_at_snapshot(
     })
 }
 
+/// Open a non-encrypted table provider at the latest snapshot.
+async fn open_provider(
+    storage: &Arc<dyn Storage>,
+    table: &str,
+    config: ProviderConfig,
+) -> PyResult<IcefallDBTableProvider> {
+    IcefallDBTableProvider::new(Arc::clone(storage), table, config)
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("provider '{table}': {e:?}")))
+}
+
+/// Open a non-encrypted table provider pinned to a historical snapshot.
+async fn open_provider_at_snapshot(
+    storage: &Arc<dyn Storage>,
+    table: &str,
+    config: ProviderConfig,
+    sequence: u64,
+) -> PyResult<IcefallDBTableProvider> {
+    IcefallDBTableProvider::new_at_snapshot(Arc::clone(storage), table, config, sequence)
+        .await
+        .map_err(|e| match e {
+            QueryError::Core(IcefallDBError::SnapshotNotFound(n)) => {
+                PyRuntimeError::new_err(format!("snapshot {n} not found for table '{table}'"))
+            }
+            other => PyRuntimeError::new_err(format!(
+                "provider '{table}' at snapshot {sequence}: {other:?}"
+            )),
+        })
+}
+
+/// Deregister a table from `ctx` if it exists, then register `provider` under `name`.
+fn replace_registered_table(
+    ctx: &SessionContext,
+    table: &str,
+    provider: IcefallDBTableProvider,
+) -> PyResult<()> {
+    let _ = ctx.deregister_table(table);
+    ctx.register_table(table, Arc::new(provider))
+        .map_err(|e| PyRuntimeError::new_err(format!("register table '{table}': {e}")))?;
+    Ok(())
+}
+
+/// Open providers for `tables` and register them in `ctx`, replacing any prior
+/// registrations. Returns `true` when at least one table is encrypted.
+async fn register_all_providers(
+    ctx: &SessionContext,
+    storage: &Arc<dyn Storage>,
+    tables: &[String],
+    snapshot: Option<u64>,
+    _key_file: Option<&str>,
+) -> PyResult<bool> {
+    let config = ProviderConfig::default();
+
+    #[cfg(feature = "encryption")]
+    {
+        let mut markers = std::collections::HashMap::new();
+        for table in tables {
+            if let Some(m) = read_enc_marker(storage, table).await? {
+                markers.insert(table.clone(), m);
+            }
+        }
+        if !markers.is_empty() {
+            let key_provider = build_key_provider(_key_file);
+            for table in tables {
+                let provider = if let Some(marker) = markers.get(table) {
+                    if let Some(seq) = snapshot {
+                        open_encrypted_at_snapshot(
+                            storage,
+                            table,
+                            config,
+                            Arc::clone(&key_provider),
+                            marker,
+                            seq,
+                        )
+                        .await?
+                    } else {
+                        open_encrypted(storage, table, config, Arc::clone(&key_provider), marker)
+                            .await?
+                    }
+                } else if let Some(seq) = snapshot {
+                    open_provider_at_snapshot(storage, table, config, seq).await?
+                } else {
+                    open_provider(storage, table, config).await?
+                };
+                replace_registered_table(ctx, table, provider)?;
+            }
+            return Ok(true);
+        }
+    }
+
+    for table in tables {
+        let provider = if let Some(seq) = snapshot {
+            open_provider_at_snapshot(storage, table, config, seq).await?
+        } else {
+            open_provider(storage, table, config).await?
+        };
+        replace_registered_table(ctx, table, provider)?;
+    }
+    Ok(false)
+}
+
 #[pymethods]
 impl IcefallDBConnection {
     /// Open `db_path` and register the given tables.
@@ -278,8 +384,6 @@ impl IcefallDBConnection {
         let bypass = bypass_caches.unwrap_or(false);
         let path = PathBuf::from(db_path);
         let server_mode = server.is_some();
-        #[cfg(not(feature = "encryption"))]
-        let _ = &key_file;
         let (ctx, table_names, storage, encrypted) = rt.block_on(async {
             let storage: Arc<dyn Storage> = Arc::new(
                 LocalStorage::new(&path)
@@ -333,63 +437,14 @@ impl IcefallDBConnection {
                         Arc::clone(&key_provider),
                     );
                     if !server_mode {
-                        for table in &table_names {
-                            let provider = if let Some(marker) = markers.get(table) {
-                                if let Some(seq) = snapshot {
-                                    open_encrypted_at_snapshot(
-                                        &storage,
-                                        table,
-                                        config,
-                                        Arc::clone(&key_provider),
-                                        marker,
-                                        seq,
-                                    )
-                                    .await?
-                                } else {
-                                    open_encrypted(
-                                        &storage,
-                                        table,
-                                        config,
-                                        Arc::clone(&key_provider),
-                                        marker,
-                                    )
-                                    .await?
-                                }
-                            } else if let Some(seq) = snapshot {
-                                IcefallDBTableProvider::new_at_snapshot(
-                                    Arc::clone(&storage),
-                                    table,
-                                    config,
-                                    seq,
-                                )
-                                .await
-                                .map_err(|e| match e {
-                                    QueryError::Core(IcefallDBError::SnapshotNotFound(n)) => {
-                                        PyRuntimeError::new_err(format!(
-                                            "snapshot {n} not found for table '{table}'"
-                                        ))
-                                    }
-                                    other => PyRuntimeError::new_err(format!(
-                                        "provider '{table}' at snapshot {seq}: {other:?}"
-                                    )),
-                                })?
-                            } else {
-                                IcefallDBTableProvider::new(Arc::clone(&storage), table, config)
-                                    .await
-                                    .map_err(|e| {
-                                        PyRuntimeError::new_err(format!(
-                                            "provider '{table}': {e:?}"
-                                        ))
-                                    })?
-                            };
-                            enc_ctx
-                                .register_table(table, Arc::new(provider))
-                                .map_err(|e| {
-                                    PyRuntimeError::new_err(format!(
-                                        "register table '{table}': {e}"
-                                    ))
-                                })?;
-                        }
+                        register_all_providers(
+                            &enc_ctx,
+                            &storage,
+                            &table_names,
+                            snapshot,
+                            key_file.as_deref(),
+                        )
+                        .await?;
                     }
                     return Ok::<_, PyErr>((enc_ctx, table_names, storage, true));
                 }
@@ -398,36 +453,8 @@ impl IcefallDBConnection {
             // Server mode is a thin client: skip opening local providers entirely
             // (the daemon owns the registered providers — that is the open-once win).
             if !server_mode {
-                for table in &table_names {
-                    let provider = if let Some(seq) = snapshot {
-                        IcefallDBTableProvider::new_at_snapshot(
-                            Arc::clone(&storage),
-                            table,
-                            config,
-                            seq,
-                        )
-                        .await
-                        .map_err(|e| match e {
-                            QueryError::Core(IcefallDBError::SnapshotNotFound(n)) => {
-                                PyRuntimeError::new_err(format!(
-                                    "snapshot {n} not found for table '{table}'"
-                                ))
-                            }
-                            other => PyRuntimeError::new_err(format!(
-                                "provider '{table}' at snapshot {seq}: {other:?}"
-                            )),
-                        })?
-                    } else {
-                        IcefallDBTableProvider::new(Arc::clone(&storage), table, config)
-                            .await
-                            .map_err(|e| {
-                                PyRuntimeError::new_err(format!("provider '{table}': {e:?}"))
-                            })?
-                    };
-                    ctx.register_table(table, Arc::new(provider)).map_err(|e| {
-                        PyRuntimeError::new_err(format!("register table '{table}': {e}"))
-                    })?;
-                }
+                register_all_providers(&ctx, &storage, &table_names, snapshot, key_file.as_deref())
+                    .await?;
             }
             Ok::<_, PyErr>((ctx, table_names, storage, false))
         })?;
@@ -454,6 +481,8 @@ impl IcefallDBConnection {
             storage,
             server,
             read_only: snapshot.is_some(),
+            snapshot,
+            key_file,
         })
     }
 
@@ -527,6 +556,30 @@ impl IcefallDBConnection {
     /// Return the number of tables registered in this connection.
     fn table_count(&self) -> usize {
         self.tables.len()
+    }
+
+    /// Re-open all registered tables at their latest snapshots and re-register
+    /// them in the DataFusion session.
+    ///
+    /// This is a no-op for snapshot-pinned connections and for daemon-mode
+    /// thin clients (the daemon owns provider refresh).
+    fn refresh_providers(&self, py: Python<'_>) -> PyResult<()> {
+        if self.read_only || self.server.is_some() {
+            return Ok(());
+        }
+        let ctx = Arc::clone(&self.ctx);
+        let storage = Arc::clone(&self.storage);
+        let tables = self.tables.clone();
+        let key_file = self.key_file.clone();
+        let snapshot = self.snapshot;
+        py.detach(|| {
+            self.rt.block_on(async {
+                let guard = ctx.lock().await;
+                register_all_providers(&guard, &storage, &tables, snapshot, key_file.as_deref())
+                    .await
+                    .map(|_| ())
+            })
+        })
     }
 
     /// Clear all cached query results for this database.

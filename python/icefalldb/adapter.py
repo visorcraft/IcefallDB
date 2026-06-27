@@ -675,6 +675,15 @@ class _NativeIcefallDBConnection:
     This is the preferred ``engine="datafusion"`` path: it keeps a long-lived
     DataFusion ``SessionContext`` in Rust and returns ``pyarrow.Table`` results
     with zero JSON serialization overhead.
+
+    Direct native connections are **live** by default: before each query (and
+    mutation) they compare the on-disk manifest pointer and WAL signature
+    against the signature captured at the last refresh. If an external writer
+    advanced the table, the registered providers are reopened and re-registered
+    so the query sees the latest snapshot.
+
+    Connections opened with ``snapshot=N`` are instead pinned to that historical
+    snapshot and never auto-refresh; mutations are rejected.
     """
 
     def __init__(
@@ -690,6 +699,7 @@ class _NativeIcefallDBConnection:
 
         self.db_path = Path(db_path).resolve()
         self.tables = list(tables)
+        self._snapshot = snapshot
         self._conn = icefalldb_query_py.IcefallDBConnection(
             str(self.db_path),
             self.tables,
@@ -698,10 +708,60 @@ class _NativeIcefallDBConnection:
             result_cache_evict=result_cache_evict,
             key_file=str(key_file) if key_file is not None else None,
         )
+        # Per-table manifest/WAL signatures used to detect external writes.
+        # Snapshot-pinned connections remain fixed and do not track freshness.
+        self._manifest_sigs: dict[str, tuple] = {}
+        if self._snapshot is None:
+            for table in self.tables:
+                self._manifest_sigs[table] = self._manifest_sig(self.db_path, table)
+
+    @staticmethod
+    def _manifest_sig(db_path: Path, table: str):
+        """Return a cheap change signature for a table's manifest pointer + WAL.
+
+        Mirrors ``IcefallDBRouter._manifest_sig`` so the hybrid router and the
+        direct native connection agree on what constitutes a snapshot advance.
+        Returns ``None`` when neither the manifest pointer nor the WAL log exists.
+        """
+        table_dir = _table_dir_for(db_path, table)
+        try:
+            ps = (table_dir / "_manifest.json").stat()
+            sig = (ps.st_mtime_ns, ps.st_size, ps.st_ino)
+        except OSError:
+            sig = None
+        try:
+            ws = (table_dir / "_wal" / "mutations.log").stat()
+            wal = (ws.st_mtime_ns, ws.st_size, ws.st_ino)
+        except OSError:
+            wal = None
+        if sig is None and wal is None:
+            return None
+        return (sig, wal)
+
+    def _ensure_fresh(self, sql: str) -> None:
+        """Refresh registered providers if any referenced table advanced.
+
+        Snapshot-pinned connections are intentionally left untouched.
+        """
+        if self._snapshot is not None:
+            return
+        stale = False
+        for table in self.tables:
+            if _table_referenced_in_sql(sql, table):
+                if self._manifest_sig(self.db_path, table) != self._manifest_sigs.get(
+                    table
+                ):
+                    stale = True
+                    break
+        if stale:
+            self._conn.refresh_providers()
+            for table in self.tables:
+                self._manifest_sigs[table] = self._manifest_sig(self.db_path, table)
 
     def sql(self, sql: str, engine: str | None = None) -> IcefallDBQueryResult:
         """Execute ``sql`` and return a [`IcefallDBQueryResult`]."""
         del engine  # _NativeIcefallDBConnection is DataFusion-only
+        self._ensure_fresh(sql)
         table = self._conn.sql(sql)
         return IcefallDBQueryResult(table)
 
@@ -711,7 +771,13 @@ class _NativeIcefallDBConnection:
         Requires a single registered table (the PyO3 bridge resolves the Writer
         from the lone registered table root).
         """
-        return self._conn.mutate(sql)
+        self._ensure_fresh(sql)
+        affected = self._conn.mutate(sql)
+        # Record the new manifest/WAL signature so the next query does not pay
+        # for an unnecessary refresh.
+        for table in self.tables:
+            self._manifest_sigs[table] = self._manifest_sig(self.db_path, table)
+        return affected
 
     def clear_cache(self) -> None:
         """Clear the persistent query-result cache for this database."""
@@ -1644,8 +1710,10 @@ def attach(
     attached as a view named after the directory.
 
     Set ``engine="datafusion"`` to use the native DataFusion query engine via the
-    ``icefalldb query`` CLI. In that case a [`IcefallDBConnection`] is returned instead
-    of a DuckDB connection.
+    Rust PyO3 extension. In that case a [`_NativeIcefallDBConnection`] is returned
+    instead of a DuckDB connection. Direct native connections are live: they detect
+    manifest/WAL advances from external writers and refresh their registered
+    providers before each query.
 
     Set ``engine="icefalldb"`` to use a routing connection that runs SELECTs on
     DuckDB (for fast vectorised scans) and mutations on the native DataFusion
