@@ -17,8 +17,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::{AsArray, RecordBatch};
-use arrow::datatypes::UInt64Type;
+use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch};
+use arrow::datatypes::{DataType, UInt64Type};
 use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::logical_expr::{col, Expr, Operator};
 use datafusion::prelude::SessionContext;
@@ -627,10 +627,14 @@ pub async fn plan_update(
 pub enum MatchedAction {
     /// Update the target row's columns from the source row.
     ///
-    /// When `columns` is `None`, all columns are updated.  When it is `Some`,
-    /// only the named columns are updated and the rest are preserved (not yet
-    /// supported — we always update all columns).
+    /// All source columns are written to the target row, preserving the source
+    /// schema order.
     UpdateAll,
+    /// Update only the named target columns.  The RHS expression (as a SQL
+    /// string) may reference source columns via the source alias and target
+    /// columns via the target table name; unassigned columns are preserved from
+    /// the target pre-image.
+    UpdateAssignments(Vec<(String, String)>),
 }
 
 /// What to do when the MERGE key has no live match in the target table (the
@@ -693,6 +697,7 @@ pub async fn execute_merge(
         table,
         key,
         src,
+        "",
         matched,
         not_matched,
     )
@@ -714,6 +719,7 @@ async fn execute_merge_to_delta(
     table: &str,
     key: &str,
     src: RecordBatch,
+    source_alias: &str,
     matched: MatchedAction,
     not_matched: NotMatchedAction,
 ) -> crate::Result<MergeDelta> {
@@ -868,20 +874,48 @@ async fn execute_merge_to_delta(
         });
     }
 
-    let MatchedAction::UpdateAll = matched;
     let NotMatchedAction::Insert = not_matched;
 
     // Post-image batch for matched rows (empty batch when none matched).
-    let matched_batch = record_batch_from_rows(&matched_rows, src.schema())?;
+    let (matched_batch, set_columns) = match matched {
+        MatchedAction::UpdateAll => {
+            let batch = record_batch_from_rows(&matched_rows, src.schema())?;
+            let set_cols: Vec<String> = src
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            (batch, set_cols)
+        }
+        MatchedAction::UpdateAssignments(ref assignments) => {
+            if source_alias.is_empty() {
+                return Err(QueryError::Other(
+                    "MERGE UPDATE SET requires the USING source to have an alias".into(),
+                ));
+            }
+            let batch = build_matched_batch_with_assignments(
+                ctx,
+                table,
+                key,
+                source_alias,
+                &src.schema(),
+                &matched_rows,
+                &matched_locs,
+                assignments,
+            )
+            .await?;
+            let set_cols: Vec<String> = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            (batch, set_cols)
+        }
+    };
     // Insert batch for unmatched rows (empty batch when none unmatched).
     let insert_batch = record_batch_from_rows(&unmatched_rows, src.schema())?;
-
-    let set_columns: Vec<String> = src
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
 
     let wal_mode = resolve_wal_mode(ctx, table).await;
     let writer = Writer::new(Arc::clone(&storage), table_root, schema)
@@ -994,6 +1028,268 @@ fn record_batch_from_rows(
         .collect::<crate::Result<Vec<_>>>()?;
 
     RecordBatch::try_new(schema, arrays).map_err(QueryError::Arrow)
+}
+
+/// Return the set of real (non-pseudo) column names for a provider schema.
+///
+/// IcefallDB providers append `_rowid` and `_rowaddr` pseudo-columns after the
+/// data columns; this helper strips them.
+fn data_column_names(schema: &arrow::datatypes::SchemaRef) -> HashSet<String> {
+    let n_data = schema.fields().len().saturating_sub(2);
+    schema
+        .fields()
+        .iter()
+        .take(n_data)
+        .map(|f| f.name().clone())
+        .collect()
+}
+
+/// Validate that every UPDATE SET target exists in the table's data schema.
+fn validate_update_targets(
+    table_name: &str,
+    schema: &arrow::datatypes::SchemaRef,
+    sets: &[(String, Expr)],
+) -> Result<()> {
+    let data_cols = data_column_names(schema);
+    for (name, _) in sets {
+        if !data_cols.contains(name) {
+            return Err(QueryError::Other(format!(
+                "UPDATE SET target column '{name}' does not exist in table '{table_name}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Parse and validate the assignments in a `WHEN MATCHED THEN UPDATE SET`
+/// clause.
+///
+/// Returns a vector of `(target_column, rhs_sql_string)` pairs.  The RHS string
+/// is the original SQL expression and may reference source columns through the
+/// source alias and target columns through the target table name.
+fn parse_merge_update_assignments(
+    table_name: &str,
+    schema: &arrow::datatypes::SchemaRef,
+    assignments: &[datafusion::sql::sqlparser::ast::Assignment],
+) -> Result<Vec<(String, String)>> {
+    let data_cols = data_column_names(schema);
+    let mut out = Vec::with_capacity(assignments.len());
+    let mut seen = HashSet::new();
+
+    for assignment in assignments {
+        let target = match &assignment.target {
+            AssignmentTarget::ColumnName(obj_name) => obj_name
+                .0
+                .last()
+                .and_then(|p| p.as_ident())
+                .map(|ident| ident.value.clone())
+                .ok_or_else(|| {
+                    QueryError::Other(
+                        "MERGE UPDATE SET target column name is not a plain identifier".into(),
+                    )
+                })?,
+            AssignmentTarget::Tuple(_) => {
+                return Err(QueryError::Other(
+                    "MERGE UPDATE SET tuple assignment targets are not supported".into(),
+                ));
+            }
+        };
+
+        if !data_cols.contains(&target) {
+            return Err(QueryError::Other(format!(
+                "MERGE UPDATE SET target column '{target}' does not exist in table '{table_name}'"
+            )));
+        }
+
+        if !seen.insert(target.clone()) {
+            return Err(QueryError::Other(format!(
+                "MERGE UPDATE SET target column '{target}' specified more than once"
+            )));
+        }
+
+        out.push((target, assignment.value.to_string()));
+    }
+
+    Ok(out)
+}
+
+/// Extract the alias (or name) of a MERGE USING source.
+fn extract_source_alias(source: &TableFactor) -> Option<String> {
+    match source {
+        TableFactor::Derived { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+        TableFactor::Table { name, alias, .. } => {
+            alias.as_ref().map(|a| a.name.value.clone()).or_else(|| {
+                name.0
+                    .last()
+                    .and_then(|p| p.as_ident())
+                    .map(|i| i.value.clone())
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Quote an identifier for use in a SQL string.
+fn quote_sql_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Build the post-image RecordBatch for a MERGE ... UPDATE SET with explicit
+/// assignments.
+///
+/// A temporary table containing the matched source rows (plus an ordering
+/// column) is registered and joined to the target table on the merge key.  The
+/// SELECT list evaluates each assignment expression over the joined row and
+/// preserves unassigned target columns from the target pre-image.  The result
+/// is ordered by the synthetic ordering column so it remains aligned with
+/// `matched_locs` before `commit_merge` sorts both by row_id.
+#[allow(clippy::too_many_arguments)]
+async fn build_matched_batch_with_assignments(
+    ctx: &SessionContext,
+    table: &str,
+    key_col: &str,
+    source_alias: &str,
+    src_schema: &arrow::datatypes::SchemaRef,
+    matched_rows: &[RecordBatchRow],
+    _matched_locs: &[MatchLoc],
+    assignments: &[(String, String)],
+) -> Result<RecordBatch> {
+    let n_rows = matched_rows.len();
+
+    // Target data schema (pseudo-columns excluded).
+    let provider = ctx
+        .table_provider(table)
+        .await
+        .map_err(|e| QueryError::Other(format!("table not registered: {e}")))?;
+    let full_schema = provider.schema();
+    let n_data = full_schema.fields().len().saturating_sub(2);
+    let target_data_fields: Vec<Arc<arrow::datatypes::Field>> =
+        full_schema.fields().iter().take(n_data).cloned().collect();
+    let target_data_schema = Arc::new(arrow::datatypes::Schema::new(target_data_fields.clone()));
+
+    if n_rows == 0 {
+        let empty_cols: Vec<ArrayRef> = target_data_schema
+            .fields()
+            .iter()
+            .map(|f| arrow::array::new_empty_array(f.data_type()))
+            .collect();
+        return RecordBatch::try_new(target_data_schema, empty_cols).map_err(QueryError::Arrow);
+    }
+
+    // Build a source batch with a synthetic ordering/index column.
+    let mut src_fields: Vec<Arc<arrow::datatypes::Field>> =
+        src_schema.fields().iter().cloned().collect();
+    src_fields.push(Arc::new(arrow::datatypes::Field::new(
+        "__merge_idx__",
+        DataType::Int64,
+        false,
+    )));
+    let mut src_arrays: Vec<ArrayRef> = Vec::with_capacity(src_fields.len());
+
+    for field in src_schema.fields().iter() {
+        let mut values = Vec::with_capacity(n_rows);
+        for row in matched_rows {
+            let pos = row
+                .columns
+                .iter()
+                .position(|c| c == field.name())
+                .ok_or_else(|| {
+                    QueryError::Other(format!(
+                        "MERGE: matched source row missing column '{}'",
+                        field.name()
+                    ))
+                })?;
+            values.push(row.values[pos].clone());
+        }
+        src_arrays.push(
+            ScalarValue::iter_to_array(values)
+                .map_err(|e| QueryError::Other(format!("array build error: {e}")))?,
+        );
+    }
+    src_arrays.push(Arc::new(Int64Array::from(
+        (0..n_rows as i64).collect::<Vec<_>>(),
+    )));
+
+    let src_batch = RecordBatch::try_new(
+        Arc::new(arrow::datatypes::Schema::new(src_fields)),
+        src_arrays,
+    )
+    .map_err(QueryError::Arrow)?;
+
+    // Register the matched source rows under an internal name; the SQL alias
+    // used in the query is the original source alias so assignment RHS refs
+    // resolve correctly.
+    let internal_src_name = "__icefall_merge_src";
+    let _ = ctx.deregister_table(internal_src_name);
+    ctx.register_batch(internal_src_name, src_batch)
+        .map_err(|e| QueryError::Other(format!("MERGE: register source batch: {e}")))?;
+
+    let table_q = quote_sql_identifier(table);
+    let src_q = quote_sql_identifier(source_alias);
+    let internal_q = quote_sql_identifier(internal_src_name);
+    let key_q = quote_sql_identifier(key_col);
+    let idx_q = quote_sql_identifier("__merge_idx__");
+
+    let assignment_map: HashMap<&str, &str> = assignments
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let mut select_items: Vec<String> = Vec::with_capacity(n_data + 1);
+    for field in &target_data_fields {
+        let col_name = field.name();
+        let col_q = quote_sql_identifier(col_name);
+        let item = if let Some(rhs) = assignment_map.get(col_name.as_str()) {
+            format!("({rhs}) AS {col_q}")
+        } else {
+            format!("{table_q}.{col_q} AS {col_q}")
+        };
+        select_items.push(item);
+    }
+    select_items.push(format!("{src_q}.{idx_q}"));
+
+    let sql = format!(
+        "SELECT {} FROM {} JOIN {} AS {} ON {}.{} = {}.{} ORDER BY {}.{}",
+        select_items.join(", "),
+        table_q,
+        internal_q,
+        src_q,
+        table_q,
+        key_q,
+        src_q,
+        key_q,
+        src_q,
+        idx_q,
+    );
+
+    let batches = ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| QueryError::Other(format!("MERGE assignment evaluation error: {e}")))?
+        .collect()
+        .await
+        .map_err(|e| QueryError::Other(format!("MERGE assignment evaluation error: {e}")))?;
+
+    let _ = ctx.deregister_table(internal_src_name);
+
+    if batches.is_empty() {
+        return Err(QueryError::Other(
+            "MERGE assignment evaluation produced no rows".into(),
+        ));
+    }
+
+    let result = arrow::compute::concat_batches(&batches[0].schema(), &batches)
+        .map_err(QueryError::Arrow)?;
+    if result.num_rows() != n_rows {
+        return Err(QueryError::Other(format!(
+            "MERGE assignment evaluation produced {} rows, expected {}",
+            result.num_rows(),
+            n_rows
+        )));
+    }
+
+    let data_arrays: Vec<ArrayRef> = (0..n_data).map(|i| Arc::clone(result.column(i))).collect();
+    RecordBatch::try_new(target_data_schema, data_arrays).map_err(QueryError::Arrow)
 }
 
 /// Parse and execute a SQL statement against a IcefallDB table.
@@ -1575,6 +1871,10 @@ async fn execute_update_to_delta(
         ));
     }
 
+    // Validate all SET targets against the target schema before planning the
+    // predicate or touching any rows.
+    validate_update_targets(&table_name, &arrow_schema, &sets)?;
+
     // Build the WHERE predicate.
     let predicate = build_predicate(ctx, &table_name, &update.selection).await?;
 
@@ -1639,7 +1939,8 @@ async fn execute_update_to_delta(
 ///    the source, classifies rows, and commits updates/inserts.
 ///
 /// # Supported forms (canonical upsert)
-/// - `WHEN MATCHED THEN UPDATE SET …` → [`MatchedAction::UpdateAll`]
+/// - `WHEN MATCHED THEN UPDATE SET …` → [`MatchedAction::UpdateAssignments`]
+///   (or [`MatchedAction::UpdateAll`] when the SET list is empty)
 /// - `WHEN NOT MATCHED THEN INSERT (cols) VALUES (vals)` → [`NotMatchedAction::Insert`]
 ///
 /// # Unsupported forms (return `Err` with a clear message)
@@ -1722,8 +2023,15 @@ async fn execute_merge_sql_to_delta(
     // `CompoundIdentifier([src_alias, col])`.
     let key_col = extract_merge_key(&merge.on, &table_name)?;
 
+    // Resolve the target schema so we can validate SET targets before any write.
+    let provider = ctx
+        .table_provider(&table_name)
+        .await
+        .map_err(|e| QueryError::Other(format!("table not registered: {e}")))?;
+    let arrow_schema = provider.schema();
+
     // ── Step 4: Map WHEN clauses to action types ──────────────────────────────
-    let mut found_matched: bool = false;
+    let mut matched_action: Option<MatchedAction> = None;
     let mut found_not_matched: bool = false;
 
     for clause in &merge.clauses {
@@ -1737,8 +2045,23 @@ async fn execute_merge_sql_to_delta(
         }
         match clause.clause_kind {
             MergeClauseKind::Matched => match &clause.action {
-                MergeAction::Update(_) => {
-                    found_matched = true;
+                MergeAction::Update(update_expr) => {
+                    if matched_action.is_some() {
+                        return Err(QueryError::Other(
+                            "MERGE: multiple WHEN MATCHED THEN UPDATE clauses are not supported"
+                                .into(),
+                        ));
+                    }
+                    let assignments = parse_merge_update_assignments(
+                        &table_name,
+                        &arrow_schema,
+                        &update_expr.assignments,
+                    )?;
+                    matched_action = if assignments.is_empty() {
+                        Some(MatchedAction::UpdateAll)
+                    } else {
+                        Some(MatchedAction::UpdateAssignments(assignments))
+                    };
                 }
                 MergeAction::Delete { .. } => {
                     return Err(QueryError::Other(
@@ -1781,18 +2104,16 @@ async fn execute_merge_sql_to_delta(
         }
     }
 
-    if !found_matched && !found_not_matched {
+    if matched_action.is_none() && !found_not_matched {
         return Err(QueryError::Other(
             "MERGE: must have at least one WHEN MATCHED or WHEN NOT MATCHED clause".into(),
         ));
     }
 
     // ── Step 5: Delegate to execute_merge_to_delta ───────────────────────────
-    // At this point `found_not_matched` is guaranteed true (the guard above
-    // returned `Err` otherwise).  `found_matched` may be false when the SQL
-    // only contained a WHEN NOT MATCHED clause; execute_merge handles that
-    // correctly (zero matched rows → everything inserted).
-    let matched_action = MatchedAction::UpdateAll;
+    // `found_not_matched` is guaranteed true unless only a WHEN MATCHED clause
+    // is present; execute_merge handles the matched-only case correctly.
+    let matched_action = matched_action.unwrap_or(MatchedAction::UpdateAll);
     let not_matched_action = if found_not_matched {
         NotMatchedAction::Insert
     } else {
@@ -1803,6 +2124,13 @@ async fn execute_merge_sql_to_delta(
         ));
     };
 
+    let source_alias = extract_source_alias(&merge.source).unwrap_or_default();
+    if matches!(matched_action, MatchedAction::UpdateAssignments(_)) && source_alias.is_empty() {
+        return Err(QueryError::Other(
+            "MERGE UPDATE SET requires the USING source to have an alias".into(),
+        ));
+    }
+
     execute_merge_to_delta(
         ctx,
         storage,
@@ -1810,6 +2138,7 @@ async fn execute_merge_sql_to_delta(
         &table_name,
         &key_col,
         src_batch,
+        &source_alias,
         matched_action,
         not_matched_action,
     )
@@ -3546,6 +3875,73 @@ mod tests {
         (ctx, storage, root, tmp)
     }
 
+    /// Build a table with `rows` rows and columns `id` (Int64), `v` (Int64,
+    /// value = id * 10), and `w` (Int64, value = id * 100), plus a UNIQUE btree
+    /// index on `id`.
+    ///
+    /// Returns `(SessionContext, Arc<dyn Storage>, table_root_string, TempDir)`.
+    async fn registered_table_three_cols(
+        table_name: &str,
+        rows: usize,
+    ) -> (SessionContext, Arc<dyn Storage>, String, tempfile::TempDir) {
+        use icefalldb_core::database_catalog::DatabaseCatalog;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()).unwrap());
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+            Field::new("w", DataType::Int64, false),
+        ]));
+        let mut mdb_schema = arrow_schema_to_icefalldb(Arc::clone(&arrow_schema));
+        mdb_schema.row_group_target_rows = rows.max(1);
+
+        // Register a UNIQUE btree index on `id` before writing rows so the first
+        // commit builds the index.
+        let dbcat = DatabaseCatalog::new(Arc::clone(&storage));
+        let guard = dbcat.acquire_lock(Duration::from_secs(5)).await.unwrap();
+        dbcat
+            .create_index_definition_with_options(
+                &guard, "id_uniq", table_name, "id", "btree", true, // unique
+            )
+            .await
+            .unwrap();
+        drop(guard);
+
+        let ids: Vec<i64> = (0..rows as i64).collect();
+        let vs: Vec<i64> = ids.iter().map(|i| i * 10).collect();
+        let ws: Vec<i64> = ids.iter().map(|i| i * 100).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int64Array::from(vs)),
+                Arc::new(Int64Array::from(ws)),
+            ],
+        )
+        .unwrap();
+
+        let mut writer = Writer::create(Arc::clone(&storage), table_name, mdb_schema)
+            .await
+            .unwrap();
+        writer.insert_batch(batch).await.unwrap();
+        writer.commit().await.unwrap();
+
+        let config = mutate_provider_config();
+        let provider = Arc::new(
+            IcefallDBTableProvider::new(Arc::clone(&storage), table_name, config)
+                .await
+                .unwrap(),
+        );
+        let ctx = icefalldb_session(1, 1024);
+        ctx.register_table(table_name, provider).unwrap();
+
+        let root = table_name.to_string();
+        (ctx, storage, root, tmp)
+    }
+
     /// Build a two-column source `RecordBatch` with columns `id` and `v`.
     fn make_merge_src(id: i64, v: i64) -> RecordBatch {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
@@ -3876,6 +4272,115 @@ mod tests {
             scalar_i64(&ctx, "SELECT COUNT(*) FROM t_e2e_merge").await,
             6,
             "total row count must be 6 after merge (5 original + 1 inserted)"
+        );
+    }
+
+    // ── M03/M04 data-integrity fixes ────────────────────────────────────
+
+    /// UPDATE with an unknown SET column must fail and leave the table
+    /// byte/logically unchanged.
+    #[tokio::test]
+    async fn update_unknown_set_column_fails_unchanged() {
+        let (ctx, storage, root, _tmp) = registered_table_two_cols("t_upd_bad_col", 10).await;
+
+        let count_before = scalar_i64(&ctx, "SELECT COUNT(*) FROM t_upd_bad_col").await;
+        let v_before = scalar_i64(&ctx, "SELECT v FROM t_upd_bad_col WHERE id = 5").await;
+        assert_eq!(v_before, 50, "pre-update v for id=5 must be 50");
+
+        let err = execute_sql(
+            &ctx,
+            Arc::clone(&storage),
+            &root,
+            "UPDATE t_upd_bad_col SET no_such_column = 999 WHERE id = 5",
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("UPDATE SET target column 'no_such_column' does not exist"),
+            "expected schema error, got: {msg}"
+        );
+
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT COUNT(*) FROM t_upd_bad_col").await,
+            count_before,
+            "table row count must be unchanged after failed UPDATE"
+        );
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT v FROM t_upd_bad_col WHERE id = 5").await,
+            v_before,
+            "target row must be unchanged after failed UPDATE"
+        );
+    }
+
+    /// MERGE with an unknown UPDATE SET target must fail and leave the table
+    /// unchanged.
+    #[tokio::test]
+    async fn merge_unknown_update_target_fails_unchanged() {
+        let (ctx, storage, root, _tmp) = registered_table_unique("t_merge_bad_col", 10).await;
+
+        let count_before = scalar_i64(&ctx, "SELECT COUNT(*) FROM t_merge_bad_col").await;
+
+        let merge_sql = "MERGE INTO t_merge_bad_col USING (VALUES (1, 99)) AS src(id, v) \
+             ON t_merge_bad_col.id = src.id \
+             WHEN MATCHED THEN UPDATE SET nonexistent = src.v \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (src.id, src.v)";
+
+        let err = execute_sql(&ctx, Arc::clone(&storage), &root, merge_sql)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MERGE UPDATE SET target column 'nonexistent' does not exist"),
+            "expected schema error, got: {msg}"
+        );
+
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT COUNT(*) FROM t_merge_bad_col").await,
+            count_before,
+            "table row count must be unchanged after failed MERGE"
+        );
+    }
+
+    /// MERGE UPDATE SET targets are bound by name, not position: a reordered
+    /// SET clause updates only the named columns and leaves unassigned columns
+    /// unchanged.
+    #[tokio::test]
+    async fn merge_reordered_set_updates_named_columns_only() {
+        let (ctx, storage, root, _tmp) = registered_table_three_cols("t_merge_reorder", 10).await;
+
+        // Row id=5 has v=50, w=500. Source row id=5, v=999.
+        let merge_sql = "MERGE INTO t_merge_reorder USING (VALUES (5, 999)) AS src(id, v) \
+             ON t_merge_reorder.id = src.id \
+             WHEN MATCHED THEN UPDATE SET id = src.v, v = src.id \
+             WHEN NOT MATCHED THEN INSERT (id, v, w) VALUES (src.id, src.v, 0)";
+
+        let affected = execute_sql(&ctx, Arc::clone(&storage), &root, merge_sql)
+            .await
+            .unwrap();
+        assert_eq!(affected, 1, "one matched row should be updated");
+
+        // The key was updated from 5 to 999, v was set to the original id (5),
+        // and w was preserved from the target pre-image (500).
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT id FROM t_merge_reorder WHERE w = 500").await,
+            999,
+            "id must be updated to src.v (999)"
+        );
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT v FROM t_merge_reorder WHERE w = 500").await,
+            5,
+            "v must be updated to src.id (5)"
+        );
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT COUNT(*) FROM t_merge_reorder WHERE id = 999").await,
+            1,
+            "updated row must appear exactly once"
+        );
+        assert_eq!(
+            scalar_i64(&ctx, "SELECT COUNT(*) FROM t_merge_reorder").await,
+            10,
+            "total row count must be unchanged"
         );
     }
 
