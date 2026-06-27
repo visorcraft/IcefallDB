@@ -532,3 +532,90 @@ async fn check_encrypted_table_without_key_skips_data_pages() {
         issue.message
     );
 }
+
+const SSN_COLUMN_KEY: &[u8; 16] = b"ssn-col-key-1234";
+
+/// A per-column keyset whose `ssn` column key differs from the footer key, so
+/// the checker must resolve and use the *distinct* per-column key (not the
+/// footer key) to validate the encrypted column's data pages.
+fn distinct_column_key_set() -> EncryptionKeySet {
+    let mut cols = BTreeMap::new();
+    cols.insert("ssn".to_string(), SSN_COLUMN_KEY.to_vec());
+    EncryptionKeySet::with_columns(FOOTER_KEY.to_vec(), cols, table_aad_prefix("events", 1))
+        .unwrap()
+}
+
+/// M09: the checker validates a per-column-encrypted table when given both the
+/// footer key and the distinct per-column key. Given only the footer key it
+/// skips data-page validation for the encrypted column (reported as Info)
+/// rather than failing or silently passing as fully validated.
+#[tokio::test]
+async fn check_per_column_encrypted_table_resolves_distinct_column_key() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let cfg = EncryptionWriteConfig::new(distinct_column_key_set())
+        .with_encrypted_columns(["ssn".to_string()]);
+
+    let mut writer = Writer::create_with_full(
+        Arc::clone(&storage),
+        "events",
+        make_two_col_schema(),
+        WriterOptionsFull::new().with_encryption(cfg.clone()),
+    )
+    .await
+    .expect("create encrypted writer");
+    writer
+        .insert_batch(make_two_col_batch())
+        .await
+        .expect("insert");
+    writer.commit().await.expect("commit");
+
+    // Full provider (footer + distinct column key): data pages are validated.
+    // A wrong column key would fail GCM auth here, so `passed` proves the
+    // distinct per-column key was resolved and used.
+    let full = Arc::new(StaticKeyProvider::from_key_set("events-v1", &cfg.keys));
+    let result = icefalldb_core::Checker::new_with_options(
+        storage.as_ref(),
+        "events",
+        CheckOptions::new().with_key_provider(full),
+    )
+    .check()
+    .await
+    .unwrap();
+    assert!(result.passed, "unexpected issues: {:?}", result.issues);
+    assert!(
+        !result
+            .issues
+            .iter()
+            .any(|i| i.code == "ENCRYPTION_KEY_UNAVAILABLE"),
+        "data-page validation must run when the column key is supplied: {:?}",
+        result.issues
+    );
+
+    // Footer key only: the distinct column key is missing, so data-page
+    // validation is skipped (Info), and metadata checks still pass.
+    let footer_only = Arc::new(StaticKeyProvider::from_key_set(
+        "events-v1",
+        &EncryptionKeySet::footer_only(FOOTER_KEY.to_vec(), table_aad_prefix("events", 1)).unwrap(),
+    ));
+    let result = icefalldb_core::Checker::new_with_options(
+        storage.as_ref(),
+        "events",
+        CheckOptions::new().with_key_provider(footer_only),
+    )
+    .check()
+    .await
+    .unwrap();
+    assert!(
+        result.passed,
+        "metadata checks must still pass without the column key: {:?}",
+        result.issues
+    );
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|i| i.code == "ENCRYPTION_KEY_UNAVAILABLE" && i.severity == Severity::Info),
+        "a missing column key must skip data-page validation: {:?}",
+        result.issues
+    );
+}

@@ -5457,7 +5457,19 @@ pub fn compute_row_group_meta_from_footer(
     encrypted_columns: &std::collections::HashSet<String>,
     row_ids: &[RowIdSegment],
 ) -> Result<RowGroupMeta> {
-    let columns = derive_footer_stats_for_repair(schema, parquet_metadata, encrypted_columns)?;
+    let (mut columns, needs_recompute) =
+        derive_footer_stats_for_repair(schema, parquet_metadata, encrypted_columns)?;
+
+    // Externally-ingested Parquet may carry no column statistics in its footer.
+    // A footer-only meta would then record nulls=0/min=max=None for those
+    // columns, which the checker later flags against the real data. Read just
+    // the affected (non-encrypted) columns and compute exact statistics so the
+    // regenerated meta matches the data. IcefallDB-written files always carry
+    // footer stats, so this fallback never fires for them (no extra I/O).
+    if !needs_recompute.is_empty() {
+        recompute_repair_stats_from_data(parquet_bytes, &needs_recompute, &mut columns)?;
+    }
+
     let column_offsets = compute_column_offsets(parquet_metadata, schema);
     let mut meta = RowGroupMeta {
         row_group: rg_id.to_string(),
@@ -5479,13 +5491,19 @@ pub fn compute_row_group_meta_from_footer(
 /// Unlike the fast-path [`Writer::derive_footer_stats`], this function is
 /// best-effort: unsupported columns are omitted, and missing min/max are
 /// represented as `None`. Encrypted columns are skipped entirely.
+///
+/// Returns the derived stats plus a list of `(column name, leaf index)` for
+/// columns whose footer lacked statistics on at least one row group: those
+/// stats are unreliable and the caller must recompute them from the data.
+#[allow(clippy::type_complexity)]
 fn derive_footer_stats_for_repair(
     schema: &Schema,
     metadata: &parquet::file::metadata::ParquetMetaData,
     encrypted_columns: &std::collections::HashSet<String>,
-) -> Result<HashMap<String, ColumnStats>> {
+) -> Result<(HashMap<String, ColumnStats>, Vec<(String, usize)>)> {
     let schema_descr = metadata.file_metadata().schema_descr();
     let mut columns = HashMap::new();
+    let mut needs_recompute: Vec<(String, usize)> = Vec::new();
 
     for col in &schema.columns {
         if encrypted_columns.contains(&col.name) {
@@ -5507,10 +5525,12 @@ fn derive_footer_stats_for_repair(
         let mut nulls: usize = 0;
         let mut min: Option<serde_json::Value> = None;
         let mut max: Option<serde_json::Value> = None;
+        let mut stats_present_all = true;
 
         for rg in metadata.row_groups() {
             let col_meta = rg.column(leaf_idx);
             let Some(stats) = col_meta.statistics() else {
+                stats_present_all = false;
                 continue;
             };
             nulls += stats.null_count_opt().unwrap_or(0) as usize;
@@ -5521,10 +5541,52 @@ fn derive_footer_stats_for_repair(
             }
         }
 
+        // A row group with rows but no footer statistics yields bogus
+        // nulls=0/min=max=None; mark the column for an exact recompute.
+        if !stats_present_all {
+            needs_recompute.push((col.name.clone(), leaf_idx));
+        }
         columns.insert(col.name.clone(), ColumnStats { min, max, nulls });
     }
 
-    Ok(columns)
+    Ok((columns, needs_recompute))
+}
+
+/// Recompute exact statistics for `needs_recompute` columns by reading the
+/// Parquet data. Used by [`compute_row_group_meta_from_footer`] when the footer
+/// lacks statistics. Only the listed (non-encrypted, single-leaf) columns are
+/// projected, so encrypted column chunks are never touched.
+fn recompute_repair_stats_from_data(
+    parquet_bytes: &[u8],
+    needs_recompute: &[(String, usize)],
+    columns: &mut HashMap<String, ColumnStats>,
+) -> Result<()> {
+    use parquet::arrow::ProjectionMask;
+
+    let bytes = Bytes::copy_from_slice(parquet_bytes);
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(other)?;
+    let leaves = needs_recompute.iter().map(|(_, idx)| *idx);
+    let mask = ProjectionMask::leaves(builder.parquet_schema(), leaves);
+    let reader = builder.with_projection(mask).build().map_err(other)?;
+
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    for batch in reader {
+        batches.push(batch.map_err(other)?);
+    }
+    if batches.is_empty() {
+        return Ok(()); // no rows: nulls=0/min=max=None is already exact
+    }
+
+    let combined = arrow::compute::concat_batches(&batches[0].schema(), &batches).map_err(other)?;
+    for (name, _) in needs_recompute {
+        let Some(array) = combined.column_by_name(name) else {
+            continue;
+        };
+        let nulls = array.null_count();
+        let (min, max) = compute_min_max(array, name)?;
+        columns.insert(name.clone(), ColumnStats { min, max, nulls });
+    }
+    Ok(())
 }
 
 /// Read a `.meta` sidecar and return its row count if it is valid.

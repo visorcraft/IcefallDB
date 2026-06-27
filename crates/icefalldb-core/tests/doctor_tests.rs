@@ -830,3 +830,84 @@ async fn test_doctor_repair_fails_when_schema_file_missing() {
 
     assert!(matches!(err, IcefallDBError::TableNotFound(_)), "{err}");
 }
+
+// M15-C: the doctor must run the full table checker so deep row-group / data
+// integrity problems are not reported healthy. These three cases all leave the
+// table structurally intact (valid pointer, present `.meta`, intact chain) so
+// only the checker catches them.
+
+#[tokio::test]
+async fn test_doctor_flags_corrupt_row_group_meta() {
+    let (storage, table) = setup_committed_table().await;
+    let manifest = read_latest_manifest(storage.as_ref(), &table).await;
+    let meta_path = format!("{}/{}", table, manifest.row_groups[0].meta);
+
+    // Tamper with the row count but leave the stored meta_checksum intact: the
+    // file is still present (structural check passes) but its checksum no longer
+    // matches its contents.
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&storage.read(&meta_path).await.unwrap()).unwrap();
+    meta["rows"] = serde_json::json!(9999);
+    storage
+        .write(&meta_path, &serde_json::to_vec(&meta).unwrap())
+        .await
+        .unwrap();
+
+    let doctor = Doctor::new(storage.as_ref(), &table);
+
+    let diag = doctor.diagnose().await.unwrap();
+    assert!(!diag.healthy, "corrupt .meta must not be reported healthy");
+    assert!(diag
+        .issues
+        .iter()
+        .any(|i| i.kind == DiagnosisKind::IntegrityError));
+
+    let repair = doctor.repair().await.unwrap();
+    assert!(
+        !repair.healthy,
+        "corrupt .meta is not safely auto-repairable"
+    );
+    assert!(repair
+        .actions
+        .iter()
+        .any(|a| a.kind == ActionKind::Unrepairable));
+}
+
+#[tokio::test]
+async fn test_doctor_flags_data_checksum_mismatch() {
+    let (storage, table) = setup_committed_table().await;
+    let manifest = read_latest_manifest(storage.as_ref(), &table).await;
+    let data_path = format!("{}/{}", table, manifest.row_groups[0].data);
+
+    // Append a byte: the data no longer matches the checksum recorded in `.meta`.
+    let mut bytes = storage.read(&data_path).await.unwrap();
+    bytes.push(0);
+    storage.write(&data_path, &bytes).await.unwrap();
+
+    let doctor = Doctor::new(storage.as_ref(), &table);
+    let diag = doctor.diagnose().await.unwrap();
+    assert!(!diag.healthy, "data-checksum mismatch must not be healthy");
+    assert!(diag
+        .issues
+        .iter()
+        .any(|i| i.kind == DiagnosisKind::IntegrityError));
+}
+
+#[tokio::test]
+async fn test_doctor_flags_missing_data_file() {
+    let (storage, table) = setup_committed_table().await;
+    let manifest = read_latest_manifest(storage.as_ref(), &table).await;
+    let data_path = format!("{}/{}", table, manifest.row_groups[0].data);
+
+    // Delete the data file but keep its `.meta`: the structural presence check
+    // for sidecars stays happy, so only the checker notices the missing data.
+    storage.delete(&data_path).await.unwrap();
+
+    let doctor = Doctor::new(storage.as_ref(), &table);
+    let diag = doctor.diagnose().await.unwrap();
+    assert!(!diag.healthy, "missing data file must not be healthy");
+    assert!(diag
+        .issues
+        .iter()
+        .any(|i| i.kind == DiagnosisKind::IntegrityError));
+}

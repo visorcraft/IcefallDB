@@ -38,6 +38,27 @@ impl fmt::Display for ActionKind {
     }
 }
 
+/// Error codes from the full table [`crate::check::Checker`] that represent
+/// deep row-group / data integrity problems the doctor's own structural checks
+/// do not otherwise surface. Folding these into `diagnose`/`repair` stops a
+/// corrupt-but-present `.meta`, a data-checksum mismatch, or a missing data
+/// file from being reported healthy.
+///
+/// Codes the doctor already reports itself (manifest pointer, orphans, chain
+/// breaks, missing `.meta`, schema pointer) are intentionally excluded to avoid
+/// double-reporting.
+const DEEP_INTEGRITY_CODES: &[&str] = &[
+    "CORRUPT_ROW_GROUP_META",
+    "ROW_GROUP_CHECKSUM_MISMATCH",
+    "MISSING_ROW_GROUP_DATA",
+    "MISSING_ROW_GROUP_SCHEMA",
+    "ROW_COUNT_MISMATCH",
+    "NULL_COUNT_MISMATCH",
+    "MIN_MAX_MISMATCH",
+    "SCHEMA_MISMATCH",
+    "PARQUET_OPEN_ERROR",
+];
+
 fn is_repair_mutation(kind: &ActionKind) -> bool {
     matches!(
         kind,
@@ -78,6 +99,11 @@ pub enum DiagnosisKind {
     InvalidManifestSnapshot,
     NewerInvalidManifest,
     MissingRowGroupMeta,
+    /// A deep row-group/data integrity problem surfaced by the full table
+    /// [`crate::check::Checker`] (e.g. a corrupt-but-present `.meta`, a
+    /// data-checksum mismatch, or a missing data file) that the structural
+    /// checks above do not otherwise detect.
+    IntegrityError,
     Info,
 }
 
@@ -91,6 +117,7 @@ impl fmt::Display for DiagnosisKind {
             DiagnosisKind::InvalidManifestSnapshot => write!(f, "InvalidManifestSnapshot"),
             DiagnosisKind::NewerInvalidManifest => write!(f, "NewerInvalidManifest"),
             DiagnosisKind::MissingRowGroupMeta => write!(f, "MissingRowGroupMeta"),
+            DiagnosisKind::IntegrityError => write!(f, "IntegrityError"),
             DiagnosisKind::Info => write!(f, "Info"),
         }
     }
@@ -234,6 +261,17 @@ impl<'a> Doctor<'a> {
 
         self.diagnose_chain(&mut issues).await?;
 
+        // Deep row-group/data validation the structural checks above skip: a
+        // corrupt-but-present `.meta`, a data-checksum mismatch, or a missing
+        // data file would otherwise be reported healthy.
+        for issue in self.deep_integrity_errors().await? {
+            issues.push(DiagnosisIssue {
+                kind: DiagnosisKind::IntegrityError,
+                path: issue.code,
+                detail: issue.message,
+            });
+        }
+
         Ok(DiagnosisResult {
             table: self.table.clone(),
             healthy: issues.iter().all(|i| i.kind == DiagnosisKind::Info),
@@ -322,6 +360,19 @@ impl<'a> Doctor<'a> {
 
         let orphan_actions = self.delete_orphans(chosen_seq, &valid_snapshots).await?;
         actions.extend(orphan_actions);
+
+        // After the structural repairs (pointer, intents, regenerated `.meta`s,
+        // orphans), run the full checker to verify deep integrity. Anything it
+        // still flags as an error (a corrupt-but-present `.meta`, a data-checksum
+        // mismatch, a missing data file) is not safely auto-repairable; record
+        // it so the result is not reported healthy.
+        for issue in self.deep_integrity_errors().await? {
+            actions.push(RepairAction {
+                kind: ActionKind::Unrepairable,
+                path: issue.code,
+                detail: issue.message,
+            });
+        }
 
         Ok(RepairResult {
             table: self.table.clone(),
@@ -480,6 +531,25 @@ impl<'a> Doctor<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Run the full table checker and return its error-severity issues that
+    /// represent deep row-group / data integrity problems (see
+    /// [`DEEP_INTEGRITY_CODES`]). The checker validates encrypted tables at the
+    /// metadata/checksum level without a key provider, so no key plumbing is
+    /// needed: a data-checksum mismatch or corrupt `.meta` is caught either way.
+    async fn deep_integrity_errors(&self) -> Result<Vec<crate::check::CheckIssue>> {
+        let result = crate::check::Checker::new(self.storage, &self.table)
+            .check()
+            .await?;
+        Ok(result
+            .issues
+            .into_iter()
+            .filter(|i| {
+                i.severity == crate::check::Severity::Error
+                    && DEEP_INTEGRITY_CODES.contains(&i.code.as_str())
+            })
+            .collect())
     }
 
     /// Detect missing row-group metadata sidecars.
@@ -1248,11 +1318,16 @@ pub async fn verify_history(storage: &dyn Storage, table: &str) -> Result<Histor
         // corrupted.  We cannot trust m.checksum for the chain link, so
         // reset prev and skip the parent check for this entry.
         //
-        // An empty `checksum` field marks a pre-checksum (legacy) manifest;
-        // treat it like an anchor rather than a break.
+        // An empty `checksum` field marks a pre-checksum (legacy) manifest and
+        // is treated like an anchor rather than a break -- but ONLY when
+        // `committed_at` is also absent. `committed_at` was introduced together
+        // with hash chaining, so a genuine legacy manifest has neither field. A
+        // manifest carrying a timestamp but a blanked checksum is post-chain
+        // tampering masquerading as legacy; it must fall through to the
+        // mismatch break below so it cannot evade detection.
         match m.verify_checksum() {
             Ok(true) => {}
-            Ok(false) if m.checksum.is_empty() => {
+            Ok(false) if m.checksum.is_empty() && m.committed_at.is_none() => {
                 prev = None;
                 continue;
             }

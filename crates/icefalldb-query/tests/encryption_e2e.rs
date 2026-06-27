@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use icefalldb_core::arrow_schema_to_icefalldb;
 use icefalldb_core::encryption::{
@@ -156,14 +156,34 @@ async fn encrypted_table_filter_pushdown() {
     ctx.register_table("t", Arc::new(provider)).unwrap();
 
     let batches = ctx
-        .sql("SELECT a FROM t WHERE a > 3")
+        .sql("SELECT a FROM t WHERE a > 3 ORDER BY a")
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 2); // 5 and 6
+    assert_eq!(total_rows, 2);
+    // Assert the actual decrypted values, not just the row count.
+    assert_eq!(int32_values(&batches), vec![5, 6]);
+}
+
+/// Flatten the first (Int32) column of `batches` into a Vec, skipping nulls.
+fn int32_values(batches: &[RecordBatch]) -> Vec<i32> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32 column");
+        for i in 0..col.len() {
+            if col.is_valid(i) {
+                out.push(col.value(i));
+            }
+        }
+    }
+    out
 }
 
 const COLUMN_KEY: &[u8; 16] = b"fedcba9876543210";
@@ -452,4 +472,73 @@ async fn encrypted_table_time_travel() {
 
     assert_eq!(latest_count, 12);
     assert_eq!(snapshot_count, 6);
+}
+
+/// M10: reading an encrypted table at a historic snapshot must decrypt to the
+/// correct values (not merely return the right row count), and a WHERE filter
+/// applied at that snapshot must operate on the decrypted data.
+#[tokio::test]
+async fn encrypted_snapshot_decryption_values_and_filter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = create_encrypted_table_with_two_snapshots(tmp.path()).await;
+
+    // Snapshot 1 holds a single copy of make_batch().
+    let snapshot_provider = IcefallDBTableProvider::new_encrypted_at_snapshot(
+        storage,
+        "t",
+        encrypted_provider_config(),
+        make_provider("t"),
+        KeyIdentifier::new("t-v1"),
+        BTreeMap::new(),
+        1,
+    )
+    .await
+    .unwrap();
+
+    let ctx = icefalldb_encrypted_session(1, 1024, make_provider("t"));
+    ctx.register_table("t", Arc::new(snapshot_provider))
+        .unwrap();
+
+    // Decrypted integer column at the snapshot (a = [1,2,3,null,5,6]).
+    let batches = ctx
+        .sql("SELECT a FROM t WHERE a IS NOT NULL ORDER BY a")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(int32_values(&batches), vec![1, 2, 3, 5, 6]);
+
+    // Decrypted string column at the snapshot (b = ['a','b','c','d',null,'f']).
+    let batches = ctx
+        .sql("SELECT b FROM t WHERE b IS NOT NULL ORDER BY b")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut bvals: Vec<String> = Vec::new();
+    for batch in &batches {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8 column");
+        for i in 0..col.len() {
+            if col.is_valid(i) {
+                bvals.push(col.value(i).to_string());
+            }
+        }
+    }
+    assert_eq!(bvals, vec!["a", "b", "c", "d", "f"]);
+
+    // Filter path at the snapshot: only the decrypted 5 and 6 survive a > 3.
+    let batches = ctx
+        .sql("SELECT a FROM t WHERE a > 3 ORDER BY a")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(int32_values(&batches), vec![5, 6]);
 }

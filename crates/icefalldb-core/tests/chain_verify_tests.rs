@@ -197,3 +197,69 @@ async fn legacy_none_parent_hash_is_anchor_not_break() {
         "no breaks expected for legacy None parent_hash"
     );
 }
+
+/// M06: a manifest with a blanked `checksum` but a present `committed_at` is
+/// post-chain tampering masquerading as a legacy (pre-checksum) manifest. The
+/// legacy exception applies only when `committed_at` is also absent, so this
+/// must be flagged as a break rather than silently swallowed.
+#[tokio::test]
+async fn blanked_checksum_with_timestamp_is_flagged() {
+    let (storage, table) = setup_table_with_two_inserts().await;
+
+    // Writer-produced manifests carry a commit timestamp; blank only the
+    // checksum, leaving committed_at in place.
+    let path = format!("{}/{}", table, Manifest::filename(2));
+    let mut m: Manifest = serde_json::from_slice(&storage.read(&path).await.unwrap()).unwrap();
+    assert!(
+        m.committed_at.is_some(),
+        "writer-produced manifest must carry a committed_at timestamp"
+    );
+    m.checksum = String::new();
+    storage
+        .write(&path, &serde_json::to_vec(&m).unwrap())
+        .await
+        .unwrap();
+
+    let report = verify_history(storage.as_ref(), &table).await.unwrap();
+    assert!(
+        !report.intact,
+        "a blanked-but-timestamped manifest must be flagged as a break"
+    );
+    assert!(
+        report.breaks.iter().any(|b| b.sequence == 2),
+        "break must name the tampered sequence; got: {:?}",
+        report
+            .breaks
+            .iter()
+            .map(|b| format!("seq={}: {}", b.sequence, b.reason))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Complement to M06: a genuine pre-chain legacy manifest (empty checksum AND
+/// no committed_at) is still treated as an anchor, not a break.
+#[tokio::test]
+async fn genuine_legacy_empty_checksum_is_anchor() {
+    let (storage, table) = setup_table_with_two_inserts().await;
+
+    let path = format!("{}/{}", table, Manifest::filename(2));
+    let mut m: Manifest = serde_json::from_slice(&storage.read(&path).await.unwrap()).unwrap();
+    m.checksum = String::new();
+    m.committed_at = None;
+    m.parent_hash = None;
+    storage
+        .write(&path, &serde_json::to_vec(&m).unwrap())
+        .await
+        .unwrap();
+
+    let report = verify_history(storage.as_ref(), &table).await.unwrap();
+    assert!(
+        report.intact,
+        "a legacy empty-checksum manifest with no timestamp must be an anchor: {:?}",
+        report
+            .breaks
+            .iter()
+            .map(|b| format!("seq={}: {}", b.sequence, b.reason))
+            .collect::<Vec<_>>()
+    );
+}

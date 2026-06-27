@@ -172,3 +172,66 @@ def test_datafusion_mutate_after_external_write(tmp_path):
     affected = con.mutate("DELETE FROM t WHERE id = 3")
     assert affected == 1
     assert con.sql("SELECT COUNT(*) FROM t").fetchall() == [(2,)]
+
+
+def test_datafusion_multi_table_refresh_is_isolated(tmp_path):
+    """Per-table freshness: an external write to one table refreshes only that
+    table, repeated queries return the fresh (not cache-poisoned) result, and
+    one table's write never contaminates another's cached results."""
+    if not _native_available():
+        pytest.skip("native DataFusion extension required")
+
+    db = tmp_path / "db"
+    db.mkdir()
+    _make_table(db, "a", pa.table({"id": [1, 2], "val": ["a", "b"]}, schema=_sch()))
+    _make_table(db, "b", pa.table({"id": [1], "val": ["x"]}, schema=_sch()))
+
+    con = icefalldb.attach(str(db), tables=["a", "b"], engine="datafusion")
+
+    # Warm the result cache for both tables.
+    assert con.sql("SELECT COUNT(*) FROM a").fetchall() == [(2,)]
+    assert con.sql("SELECT COUNT(*) FROM b").fetchall() == [(1,)]
+
+    # External write to `a` only.
+    extra_a = tmp_path / "a_extra.parquet"
+    pq.write_table(pa.table({"id": [3], "val": ["c"]}, schema=_sch()), extra_a)
+    _run_icefalldb("insert", str(db), "a", str(extra_a))
+
+    # `a` refreshes; `b` is untouched (no cross-table poisoning).
+    assert con.sql("SELECT COUNT(*) FROM a").fetchall() == [(3,)]
+    assert con.sql("SELECT COUNT(*) FROM b").fetchall() == [(1,)]
+    # Repeat the `a` query: the cache must serve the fresh value, not a stale one.
+    assert con.sql("SELECT COUNT(*) FROM a").fetchall() == [(3,)]
+
+    # External write to `b` only.
+    extra_b = tmp_path / "b_extra.parquet"
+    pq.write_table(pa.table({"id": [2], "val": ["y"]}, schema=_sch()), extra_b)
+    _run_icefalldb("insert", str(db), "b", str(extra_b))
+
+    # `b` refreshes; `a` keeps its own latest count, unaffected by `b`'s write.
+    assert con.sql("SELECT COUNT(*) FROM b").fetchall() == [(2,)]
+    assert con.sql("SELECT COUNT(*) FROM a").fetchall() == [(3,)]
+
+
+def test_datafusion_repeated_external_writes_never_serve_stale(tmp_path):
+    """Each external write to a live connection invalidates the result cache, so
+    a repeated identical query is never answered from a poisoned stale entry."""
+    if not _native_available():
+        pytest.skip("native DataFusion extension required")
+
+    db = tmp_path / "db"
+    db.mkdir()
+    _make_table(db, "t", pa.table({"id": [1], "val": ["a"]}, schema=_sch()))
+
+    con = icefalldb.attach(str(db), tables=["t"], engine="datafusion")
+
+    for n in range(2, 6):
+        # Warm the cache at the current snapshot.
+        assert con.sql("SELECT COUNT(*) FROM t").fetchall() == [(n - 1,)]
+        extra = tmp_path / f"extra_{n}.parquet"
+        pq.write_table(pa.table({"id": [n], "val": ["v"]}, schema=_sch()), extra)
+        _run_icefalldb("insert", str(db), "t", str(extra))
+        # Two reads in a row: the first must refresh, the second must hit the
+        # cache for the new snapshot, both fresh.
+        assert con.sql("SELECT COUNT(*) FROM t").fetchall() == [(n,)]
+        assert con.sql("SELECT COUNT(*) FROM t").fetchall() == [(n,)]

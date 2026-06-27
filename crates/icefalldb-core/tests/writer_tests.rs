@@ -1274,3 +1274,93 @@ async fn test_agg_sidecar_written_on_insert() {
         "price sumsq {price_sumsq} not within tolerance of 24.5"
     );
 }
+
+/// M15-B: an externally-ingested Parquet file may carry no footer column
+/// statistics. Regenerating a `.meta` from the footer alone would record
+/// nulls=0/min=max=None, which the checker later flags against the real data.
+/// `compute_row_group_meta_from_footer` must read the data for those columns
+/// and produce exact statistics.
+#[tokio::test]
+async fn test_repair_meta_recovers_stats_when_footer_lacks_them() {
+    use icefalldb_core::writer::compute_row_group_meta_from_footer;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::properties::{EnabledStatistics, WriterProperties};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("external.parquet");
+
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "v",
+        DataType::Int64,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&arrow_schema),
+        vec![Arc::new(Int64Array::from(vec![
+            Some(5),
+            None,
+            Some(2),
+            Some(9),
+        ]))],
+    )
+    .unwrap();
+
+    // Disable statistics entirely so the footer carries none.
+    let props = WriterProperties::builder()
+        .set_statistics_enabled(EnabledStatistics::None)
+        .build();
+    {
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+    let buf = std::fs::read(&path).unwrap();
+    let metadata = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path).unwrap())
+        .unwrap()
+        .metadata()
+        .as_ref()
+        .clone();
+
+    let mut schema = Schema {
+        schema_id: 1,
+        columns: vec![Column {
+            name: "v".into(),
+            r#type: "int64".into(),
+            nullable: true,
+            field_id: 0,
+        }],
+        partition_by: None,
+        sort: None,
+        agg_group_keys: None,
+        row_group_target_rows: 1_000,
+        row_group_target_bytes: 1024 * 1024,
+        max_field_id: 0,
+        dropped_columns: vec![],
+    };
+    schema.assign_field_ids(None);
+
+    let meta = compute_row_group_meta_from_footer(
+        "rg_x",
+        1,
+        &schema,
+        &buf,
+        &metadata,
+        &std::collections::HashSet::new(),
+        &[],
+    )
+    .unwrap();
+
+    let stats = meta.columns.get("v").expect("stats for column v");
+    assert_eq!(
+        stats.nulls, 1,
+        "null count must come from the data, not the footer"
+    );
+    assert_eq!(stats.min, Some(serde_json::json!(2)));
+    assert_eq!(stats.max, Some(serde_json::json!(9)));
+
+    // The regenerated meta must agree with its own data (meta_checksum + data
+    // checksum), so a follow-up checker run would not flag it.
+    assert!(meta.verify_meta_checksum().unwrap());
+    assert!(meta.verify_against_data(&buf));
+}

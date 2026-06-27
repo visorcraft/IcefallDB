@@ -2847,6 +2847,101 @@ mod tests {
         );
     }
 
+    /// M01 (incremental within-batch path): appending a batch that contains a
+    /// duplicate key *within itself* must be rejected even when the existing
+    /// index is already populated. This is distinct from
+    /// `unique_index_creation_rejects_duplicate_live_keys` (within-batch on an
+    /// empty index) and `unique_index_append_rejects_duplicate_keys`
+    /// (against an existing committed key): here the duplicate is internal to a
+    /// later incremental insert.
+    #[tokio::test]
+    async fn unique_index_append_rejects_within_batch_duplicate() {
+        use crate::database_catalog::DatabaseCatalog;
+        use crate::metadata::{Column, Schema};
+        use crate::Writer;
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use std::time::Duration;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+
+        let schema = Schema {
+            schema_id: 1,
+            columns: vec![Column::new("v", "int64", false)],
+            partition_by: None,
+            sort: None,
+            agg_group_keys: None,
+            row_group_target_rows: 1000,
+            row_group_target_bytes: 1 << 30,
+            dropped_columns: vec![],
+            max_field_id: 0,
+        };
+
+        let dbcat = DatabaseCatalog::new(storage.clone());
+        let guard = dbcat.acquire_lock(Duration::from_secs(5)).await.unwrap();
+        dbcat
+            .create_table(&guard, "uniq_wb", &schema)
+            .await
+            .unwrap();
+        dbcat
+            .create_index_definition_with_options(&guard, "v_uniq", "uniq_wb", "v", "btree", true)
+            .await
+            .unwrap();
+        drop(guard);
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::Int64,
+            false,
+        )]));
+
+        // First insert commits cleanly so the index is non-empty.
+        let mut writer = Writer::new(storage.clone(), "uniq_wb", schema.clone())
+            .await
+            .unwrap();
+        writer
+            .insert_batch(
+                RecordBatch::try_new(
+                    Arc::clone(&arrow_schema),
+                    vec![Arc::new(Int64Array::from(vec![1i64, 2]))],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        writer.commit().await.unwrap();
+
+        // Second incremental insert has a within-batch duplicate (5 appears
+        // twice) that does not collide with any existing key.
+        let mut writer = Writer::new(storage.clone(), "uniq_wb", schema.clone())
+            .await
+            .unwrap();
+        writer
+            .insert_batch(
+                RecordBatch::try_new(
+                    Arc::clone(&arrow_schema),
+                    vec![Arc::new(Int64Array::from(vec![5i64, 5]))],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let err = writer.commit().await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IcefallDBError::UniqueKeyViolation {
+                    ref table,
+                    ref index,
+                    ref key,
+                } if table == "uniq_wb" && index == "v_uniq" && key == "5"
+            ),
+            "expected UniqueKeyViolation for within-batch duplicate key 5, got {err:?}"
+        );
+    }
+
     /// Re-inserting a key whose only live row has been deleted must succeed.
     #[tokio::test]
     async fn unique_index_allows_reinsert_after_delete() {
