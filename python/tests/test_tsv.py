@@ -166,3 +166,19 @@ def test_read_tsv_header_escape_round_trip():
 
         round_trip = read_tsv(path)
         assert round_trip.column_names == ["col\tname", "col\n2"]
+
+
+def test_read_tsv_rejects_too_few_fields():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "too_few.tsv"
+        path.write_text("id\tname\n1\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="expected 2 fields, found 1"):
+            read_tsv(path)
+
+
+def test_read_tsv_rejects_too_many_fields():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "too_many.tsv"
+        path.write_text("id\tname\n1\talice\textra\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="expected 2 fields, found 3"):
+            read_tsv(path)

@@ -1723,12 +1723,20 @@ impl TableProvider for IcefallDBTableProvider {
         // For the native-parquet path, supply only data-column projection indices.
         // Pseudo-column indices (>= n_data) are silently ignored here because
         // `has_pseudo_in_projection` causes us to skip this path entirely.
+        //
+        // An empty pruned scan must bypass the native reader: DataFusion's
+        // ParquetExec built from zero file groups reports `UnknownPartitioning(0)`,
+        // which fails the plan sanity check (notably for scalar aggregates over
+        // empty tables). The custom `IcefallDBScanExec` handles zero row groups by
+        // reporting one empty partition and producing an empty stream.
+
         let native_config = NativeParquetConfig {
             min_filter_columns: self.config.native_parquet_threshold,
         };
         if !encryption_active
             && !has_deletions
             && !has_pseudo_in_projection
+            && !pruned.row_groups.is_empty()
             && should_use_native_parquet(
                 &self.storage,
                 &pruned,

@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::datasource::TableProvider;
 use icefalldb_core::arrow_schema_to_icefalldb;
@@ -407,4 +407,120 @@ async fn test_tiny_build_join_pushdown() {
     let expected: Vec<i64> = (1..=20).collect();
     let actual: Vec<i64> = ids.iter().map(|v| v.unwrap()).collect();
     assert_eq!(actual, expected);
+}
+
+fn empty_table_schema() -> arrow::datatypes::Schema {
+    arrow::datatypes::Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("val", DataType::Float64, true),
+    ])
+}
+
+async fn create_empty_test_table(root: &std::path::Path) -> Arc<dyn Storage> {
+    let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(root).unwrap());
+    let icefalldb_schema = arrow_schema_to_icefalldb(Arc::new(empty_table_schema()));
+    let _writer = Writer::create(Arc::clone(&storage), "t", icefalldb_schema)
+        .await
+        .unwrap();
+    // No rows inserted; commit would write an empty manifest, so leave the
+    // table in its just-created state (the provider sees zero row groups).
+    storage
+}
+
+#[tokio::test]
+async fn test_aggregates_over_empty_table() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = create_empty_test_table(tmp.path()).await;
+
+    let provider = IcefallDBTableProvider::new(
+        storage,
+        "t",
+        ProviderConfig {
+            batch_size: 1024,
+            target_partitions: 1,
+            io_coalesce_window: 0,
+            io_concurrency: 1,
+            // Keep the native reader enabled (the default) so the empty-table
+            // guard in `scan()` is exercised; without it the plan would fail
+            // with `UnknownPartitioning(0)`.
+            native_parquet_threshold: 1,
+            parquet_metadata_cache_capacity: 256,
+            tiny_table_cache_threshold_rows: 0,
+            tiny_table_cache_threshold_bytes: 0,
+            wal_mode: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let ctx = icefalldb_session(1, 1024);
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+
+    let batches = ctx
+        .sql("SELECT COUNT(*) AS c, COUNT(val) AS cv, SUM(val) AS s, AVG(val) AS a, STDDEV(val) AS sd, VAR_POP(val) AS v, MIN(val) AS mn, MAX(val) AS mx FROM t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+
+    let c = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(c, 0);
+
+    let cv = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(cv, 0);
+
+    let s = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    assert!(s.is_null(0));
+
+    let a = batches[0]
+        .column(3)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    assert!(a.is_null(0));
+
+    let sd = batches[0]
+        .column(4)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    assert!(sd.is_null(0));
+
+    let v = batches[0]
+        .column(5)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    assert!(v.is_null(0));
+
+    let mn = batches[0]
+        .column(6)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    assert!(mn.is_null(0));
+
+    let mx = batches[0]
+        .column(7)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    assert!(mx.is_null(0));
 }

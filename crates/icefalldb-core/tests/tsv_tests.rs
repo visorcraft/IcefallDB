@@ -350,3 +350,41 @@ fn test_invalid_primitive_value_error() {
         msg
     );
 }
+
+#[test]
+fn test_too_few_fields_error() {
+    let schema = make_flat_schema();
+    // Header has 5 columns; data row has 2.
+    let tsv = "id\tname\tactive\tscore\tts\n1\t1.0\n";
+    let err = decode_tsv(tsv.as_bytes(), &schema).unwrap_err();
+    let msg = format!("{}", err);
+    assert!(
+        msg.contains("expected 5 fields, found 2"),
+        "error should report expected/found counts: {}",
+        msg
+    );
+    assert!(
+        msg.contains("line 2"),
+        "error should report line number: {}",
+        msg
+    );
+}
+
+#[test]
+fn test_too_many_fields_error() {
+    let schema = make_flat_schema();
+    // Header has 5 columns; data row has 6.
+    let tsv = "id\tname\tactive\tscore\tts\n1\t1.0\tone\textra\tm\t2024-01-01T00:00:00Z\n";
+    let err = decode_tsv(tsv.as_bytes(), &schema).unwrap_err();
+    let msg = format!("{}", err);
+    assert!(
+        msg.contains("expected 5 fields, found 6"),
+        "error should report expected/found counts: {}",
+        msg
+    );
+    assert!(
+        msg.contains("line 2"),
+        "error should report line number: {}",
+        msg
+    );
+}

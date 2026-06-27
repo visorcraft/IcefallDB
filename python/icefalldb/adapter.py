@@ -2459,12 +2459,13 @@ def read_tsv(path: str | Path) -> pa.Table:
 
     header = [_unescape_tsv(cell) for cell in _split_tsv_line(lines[0])]
     data_rows: list[list[str]] = []
-    for line in lines[1:]:
+    for line_no, line in enumerate(lines[1:], start=2):
         cells = _split_tsv_line(line)
-        # Pad short rows with empty strings so column access is safe.
-        if len(cells) < len(header):
-            cells.extend([""] * (len(header) - len(cells)))
-        data_rows.append(cells[: len(header)])
+        if len(cells) != len(header):
+            raise ValueError(
+                f"TSV line {line_no}: expected {len(header)} fields, found {len(cells)}"
+            )
+        data_rows.append(cells)
 
     if not data_rows:
         return pa.table({name: pa.array([], type=pa.string()) for name in header})

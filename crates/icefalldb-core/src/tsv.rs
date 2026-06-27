@@ -243,6 +243,18 @@ impl TsvDecoder {
             }
             let line_no = zero_based + 1;
             let fields = split_tsv_line(line.as_bytes())?;
+            if fields.len() != header_fields.len() {
+                return Err(tsv_error(
+                    line_no,
+                    0,
+                    "",
+                    format!(
+                        "expected {} fields, found {}",
+                        header_fields.len(),
+                        fields.len()
+                    ),
+                ));
+            }
             for (col_idx, col) in schema.columns.iter().enumerate() {
                 let pos = positions[&col.name];
                 let raw = fields
