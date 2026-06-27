@@ -13,9 +13,10 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
+use icefalldb_core::check::{CheckOptions, Severity};
 use icefalldb_core::encryption::{
     build_decryption_properties, table_aad_prefix, EncryptionKeySet, EncryptionWriteConfig,
-    SchemaEncryptionMarker,
+    SchemaEncryptionMarker, StaticKeyProvider,
 };
 use icefalldb_core::metadata::{Column, Schema};
 use icefalldb_core::storage::memory::MemoryStorage;
@@ -458,4 +459,76 @@ async fn reopening_encrypted_table_with_matching_config_succeeds() {
     .expect("reopen with matching config");
     writer2.insert_batch(make_two_col_batch()).await.unwrap();
     writer2.commit().await.expect("second commit");
+}
+
+#[tokio::test]
+async fn check_encrypted_table_with_key_passes() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let keys = sample_key_set(FOOTER_KEY);
+    let cfg = EncryptionWriteConfig::new(keys.clone());
+
+    let mut writer = Writer::create_with_full(
+        Arc::clone(&storage),
+        "events",
+        make_two_col_schema(),
+        WriterOptionsFull::new().with_encryption(cfg.clone()),
+    )
+    .await
+    .expect("create encrypted writer");
+    writer
+        .insert_batch(make_two_col_batch())
+        .await
+        .expect("insert");
+    writer.commit().await.expect("commit");
+
+    let provider = Arc::new(StaticKeyProvider::from_key_set("events-v1", &cfg.keys));
+    let checker = icefalldb_core::Checker::new_with_options(
+        storage.as_ref(),
+        "events",
+        CheckOptions::new().with_key_provider(provider),
+    );
+    let result = checker.check().await.unwrap();
+    assert!(result.passed, "unexpected issues: {:?}", result.issues);
+    assert!(
+        !result
+            .issues
+            .iter()
+            .any(|i| i.code == "ENCRYPTION_KEY_UNAVAILABLE"),
+        "should not skip data-page validation when keys are supplied"
+    );
+}
+
+#[tokio::test]
+async fn check_encrypted_table_without_key_skips_data_pages() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let cfg = EncryptionWriteConfig::new(sample_key_set(FOOTER_KEY));
+
+    let mut writer = Writer::create_with_full(
+        Arc::clone(&storage),
+        "events",
+        make_two_col_schema(),
+        WriterOptionsFull::new().with_encryption(cfg),
+    )
+    .await
+    .expect("create encrypted writer");
+    writer
+        .insert_batch(make_two_col_batch())
+        .await
+        .expect("insert");
+    writer.commit().await.expect("commit");
+
+    let checker = icefalldb_core::Checker::new(storage.as_ref(), "events");
+    let result = checker.check().await.unwrap();
+    assert!(result.passed, "unexpected issues: {:?}", result.issues);
+    let issue = result
+        .issues
+        .iter()
+        .find(|i| i.code == "ENCRYPTION_KEY_UNAVAILABLE")
+        .expect("expected ENCRYPTION_KEY_UNAVAILABLE info issue");
+    assert_eq!(issue.severity, Severity::Info);
+    assert!(
+        issue.message.contains("data-page validation skipped"),
+        "message: {}",
+        issue.message
+    );
 }

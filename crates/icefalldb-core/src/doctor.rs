@@ -1,9 +1,14 @@
-use crate::metadata::Manifest;
+use crate::metadata::{Manifest, Schema};
 use crate::storage::Storage;
 use crate::{is_not_found, IcefallDBError, Result};
+use bytes::Bytes;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::time::Duration;
+
+#[cfg(feature = "encryption")]
+use crate::encryption::SchemaEncryptionMarker;
 
 /// Kind of repair action performed by [`Doctor`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +18,10 @@ pub enum ActionKind {
     PointerUpdated,
     OrphanRemoved,
     Skipped,
+    /// A missing row-group metadata sidecar was regenerated from the Parquet footer.
+    Regenerated,
+    /// A problem was found that `Doctor` cannot safely repair automatically.
+    Unrepairable,
 }
 
 impl fmt::Display for ActionKind {
@@ -23,6 +32,8 @@ impl fmt::Display for ActionKind {
             ActionKind::PointerUpdated => write!(f, "PointerUpdated"),
             ActionKind::OrphanRemoved => write!(f, "OrphanRemoved"),
             ActionKind::Skipped => write!(f, "Skipped"),
+            ActionKind::Regenerated => write!(f, "Regenerated"),
+            ActionKind::Unrepairable => write!(f, "Unrepairable"),
         }
     }
 }
@@ -30,7 +41,10 @@ impl fmt::Display for ActionKind {
 fn is_repair_mutation(kind: &ActionKind) -> bool {
     matches!(
         kind,
-        ActionKind::RolledBack | ActionKind::PointerUpdated | ActionKind::OrphanRemoved
+        ActionKind::RolledBack
+            | ActionKind::PointerUpdated
+            | ActionKind::OrphanRemoved
+            | ActionKind::Regenerated
     )
 }
 
@@ -46,7 +60,11 @@ pub struct RepairAction {
 #[derive(Debug, Clone)]
 pub struct RepairResult {
     pub table: String,
+    /// `true` if the repair mutated any state.
     pub repaired: bool,
+    /// `false` when unrepairable issues remain; the caller should not treat the
+    /// table as fully healthy even if `repaired` is `true`.
+    pub healthy: bool,
     pub actions: Vec<RepairAction>,
 }
 
@@ -59,6 +77,7 @@ pub enum DiagnosisKind {
     OrphanStagedPart,
     InvalidManifestSnapshot,
     NewerInvalidManifest,
+    MissingRowGroupMeta,
     Info,
 }
 
@@ -71,6 +90,7 @@ impl fmt::Display for DiagnosisKind {
             DiagnosisKind::OrphanStagedPart => write!(f, "OrphanStagedPart"),
             DiagnosisKind::InvalidManifestSnapshot => write!(f, "InvalidManifestSnapshot"),
             DiagnosisKind::NewerInvalidManifest => write!(f, "NewerInvalidManifest"),
+            DiagnosisKind::MissingRowGroupMeta => write!(f, "MissingRowGroupMeta"),
             DiagnosisKind::Info => write!(f, "Info"),
         }
     }
@@ -207,6 +227,9 @@ impl<'a> Doctor<'a> {
         self.diagnose_orphans(chosen_seq, &valid_snapshots, &mut issues)
             .await?;
 
+        self.diagnose_row_group_metas(&valid_snapshots, &mut issues)
+            .await?;
+
         self.diagnose_chain(&mut issues).await?;
 
         Ok(DiagnosisResult {
@@ -243,6 +266,7 @@ impl<'a> Doctor<'a> {
                 return Ok(RepairResult {
                     table: self.table.clone(),
                     repaired: actions.iter().any(|a| is_repair_mutation(&a.kind)),
+                    healthy: !actions.iter().any(|a| a.kind == ActionKind::Unrepairable),
                     actions,
                 });
             }
@@ -287,12 +311,18 @@ impl<'a> Doctor<'a> {
             });
         }
 
+        let manifest = valid_snapshots
+            .get(&chosen_seq)
+            .expect("chosen_seq is a valid snapshot");
+        self.repair_row_group_metas(manifest, &mut actions).await?;
+
         let orphan_actions = self.delete_orphans(chosen_seq, &valid_snapshots).await?;
         actions.extend(orphan_actions);
 
         Ok(RepairResult {
             table: self.table.clone(),
             repaired: actions.iter().any(|a| is_repair_mutation(&a.kind)),
+            healthy: !actions.iter().any(|a| a.kind == ActionKind::Unrepairable),
             actions,
         })
     }
@@ -446,6 +476,176 @@ impl<'a> Doctor<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Detect missing row-group metadata sidecars.
+    async fn diagnose_row_group_metas(
+        &self,
+        valid_snapshots: &HashMap<u64, Manifest>,
+        issues: &mut Vec<DiagnosisIssue>,
+    ) -> Result<()> {
+        let Some(manifest) = valid_snapshots.values().max_by_key(|m| m.sequence) else {
+            return Ok(());
+        };
+
+        for entry in &manifest.row_groups {
+            let meta_path = format!("{}/{}", self.table, entry.meta);
+            if self.exists_resolving_not_found(&meta_path).await? {
+                continue;
+            }
+            issues.push(DiagnosisIssue {
+                kind: DiagnosisKind::MissingRowGroupMeta,
+                path: entry.meta.clone(),
+                detail: format!("row group meta file {} is missing", entry.meta),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Regenerate missing row-group metadata sidecars from the Parquet footer.
+    ///
+    /// Any sidecar that cannot be regenerated is reported as an explicit
+    /// [`ActionKind::Unrepairable`] action so the repair result is not silently
+    /// healthy.
+    async fn repair_row_group_metas(
+        &self,
+        manifest: &Manifest,
+        actions: &mut Vec<RepairAction>,
+    ) -> Result<()> {
+        if manifest.row_groups.is_empty() {
+            return Ok(());
+        }
+
+        let Some(schema) = self.load_schema(manifest.schema_id).await? else {
+            return Ok(());
+        };
+
+        #[cfg(feature = "encryption")]
+        let encrypted_columns = self.read_encrypted_columns(&schema).await?;
+        #[cfg(not(feature = "encryption"))]
+        let encrypted_columns: HashSet<String> = HashSet::new();
+
+        let mut any_regenerated = false;
+        for entry in &manifest.row_groups {
+            let meta_path = format!("{}/{}", self.table, entry.meta);
+            if self.exists_resolving_not_found(&meta_path).await? {
+                continue;
+            }
+
+            let data_path = format!("{}/{}", self.table, entry.data);
+            let parquet_bytes = match self.storage.read(&data_path).await {
+                Ok(b) => b,
+                Err(e) if is_not_found(&e) => {
+                    actions.push(RepairAction {
+                        kind: ActionKind::Unrepairable,
+                        path: entry.meta.clone(),
+                        detail: format!(
+                            "row group meta {} is missing and data file {} is also missing",
+                            entry.meta, entry.data
+                        ),
+                    });
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            let rg_id = std::path::Path::new(&entry.data)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&entry.data);
+
+            let metadata = match ParquetRecordBatchReaderBuilder::try_new(Bytes::from(
+                parquet_bytes.clone(),
+            )) {
+                Ok(builder) => builder.metadata().as_ref().clone(),
+                Err(e) => {
+                    actions.push(RepairAction {
+                        kind: ActionKind::Unrepairable,
+                        path: entry.meta.clone(),
+                        detail: format!(
+                            "row group meta {} is missing and the Parquet footer cannot be read: {}",
+                            entry.meta, e
+                        ),
+                    });
+                    continue;
+                }
+            };
+
+            match crate::writer::compute_row_group_meta_from_footer(
+                rg_id,
+                manifest.schema_id,
+                &schema,
+                &parquet_bytes,
+                &metadata,
+                &encrypted_columns,
+            ) {
+                Ok(meta) => {
+                    self.storage
+                        .write(&meta_path, &serde_json::to_vec(&meta)?)
+                        .await?;
+                    any_regenerated = true;
+                    actions.push(RepairAction {
+                        kind: ActionKind::Regenerated,
+                        path: entry.meta.clone(),
+                        detail: format!("regenerated row group meta {}", entry.meta),
+                    });
+                }
+                Err(e) => {
+                    actions.push(RepairAction {
+                        kind: ActionKind::Unrepairable,
+                        path: entry.meta.clone(),
+                        detail: format!(
+                            "row group meta {} is missing and could not be regenerated: {}",
+                            entry.meta, e
+                        ),
+                    });
+                }
+            }
+        }
+
+        if any_regenerated {
+            self.storage.sync(&format!("{}/", self.table)).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn load_schema(&self, schema_id: u64) -> Result<Option<Schema>> {
+        let path = format!("{}/{}", self.table, Schema::filename(schema_id));
+        let data = match self.storage.read(&path).await {
+            Ok(d) => d,
+            Err(e) if is_not_found(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok(Some(serde_json::from_slice(&data)?))
+    }
+
+    #[cfg(feature = "encryption")]
+    async fn read_encrypted_columns(&self, schema: &Schema) -> Result<HashSet<String>> {
+        let path = format!("{}/_encryption.json", self.table);
+        let bytes = match self.storage.read(&path).await {
+            Ok(b) => b,
+            Err(e) if is_not_found(&e) => return Ok(HashSet::new()),
+            Err(e) => return Err(e),
+        };
+        let marker: SchemaEncryptionMarker = serde_json::from_slice(&bytes).map_err(|e| {
+            IcefallDBError::Encryption(format!(
+                "failed to parse _encryption.json for table '{}': {}",
+                self.table, e
+            ))
+        })?;
+        marker.validate().map_err(|e| {
+            IcefallDBError::Encryption(format!(
+                "invalid _encryption.json for table '{}': {}",
+                self.table, e
+            ))
+        })?;
+        if marker.column_key_ids.is_empty() {
+            Ok(schema.columns.iter().map(|c| c.name.clone()).collect())
+        } else {
+            Ok(marker.column_key_ids.keys().cloned().collect())
+        }
     }
 
     /// Validate all manifest snapshots and return the valid ones keyed by sequence.

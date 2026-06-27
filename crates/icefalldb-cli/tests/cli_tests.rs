@@ -291,6 +291,57 @@ async fn test_cli_doctor_repair_flag_repairs_missing_pointer() {
 }
 
 #[tokio::test]
+async fn test_cli_doctor_repair_regenerates_missing_meta() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_table(tmp.path()).await;
+
+    // Locate and delete the row group metadata sidecar.
+    let mut meta_path = None;
+    for entry in std::fs::read_dir(table_path(tmp.path())).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("rg_") && name.ends_with(".meta") {
+            meta_path = Some(entry.path());
+            break;
+        }
+    }
+    let meta_path = meta_path.expect("row group meta file should exist");
+    std::fs::remove_file(&meta_path).unwrap();
+
+    let output = Command::new(icefalldb_bin())
+        .arg("doctor")
+        .arg("--repair")
+        .arg(tmp.path())
+        .arg("products")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Regenerated"), "stdout: {stdout}");
+    assert!(stdout.contains("repaired"), "stdout: {stdout}");
+
+    // The sidecar should be back and `check` should pass.
+    assert!(meta_path.exists());
+    let check = Command::new(icefalldb_bin())
+        .arg("check")
+        .arg(tmp.path())
+        .arg("products")
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    assert!(String::from_utf8_lossy(&check.stdout).contains("check passed"));
+}
+
+#[tokio::test]
 async fn test_cli_doctor_diagnostic_only_no_changes() {
     let tmp = tempfile::tempdir().unwrap();
     setup_table(tmp.path()).await;

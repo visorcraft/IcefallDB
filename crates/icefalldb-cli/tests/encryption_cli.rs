@@ -219,6 +219,92 @@ fn rejects_nonexistent_encrypt_column() {
 }
 
 #[test]
+fn encrypted_check_with_key_passes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("db");
+    let tsv = tmp.path().join("t.tsv");
+    std::fs::write(&tsv, "id\tsecret\n1\t42\n").unwrap();
+    let key = "000102030405060708090a0b0c0d0e0f";
+
+    let imp = Command::new(bin())
+        .args([
+            "import",
+            db.to_str().unwrap(),
+            "t",
+            tsv.to_str().unwrap(),
+            "--encrypt",
+        ])
+        .env("ICEFALLDB_KEY_T_V1", key)
+        .output()
+        .unwrap();
+    assert!(
+        imp.status.success(),
+        "import: {}",
+        String::from_utf8_lossy(&imp.stderr)
+    );
+
+    let out = Command::new(bin())
+        .args(["check", db.to_str().unwrap(), "t"])
+        .env("ICEFALLDB_KEY_T_V1", key)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "check failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("check passed"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("ENCRYPTION_KEY_UNAVAILABLE"),
+        "should not skip data-page validation with keys: {stdout}"
+    );
+}
+
+#[test]
+fn encrypted_check_without_key_reports_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("db");
+    let tsv = tmp.path().join("t.tsv");
+    std::fs::write(&tsv, "id\tsecret\n1\t42\n").unwrap();
+    let key = "000102030405060708090a0b0c0d0e0f";
+
+    let imp = Command::new(bin())
+        .args([
+            "import",
+            db.to_str().unwrap(),
+            "t",
+            tsv.to_str().unwrap(),
+            "--encrypt",
+        ])
+        .env("ICEFALLDB_KEY_T_V1", key)
+        .output()
+        .unwrap();
+    assert!(
+        imp.status.success(),
+        "import: {}",
+        String::from_utf8_lossy(&imp.stderr)
+    );
+
+    let out = Command::new(bin())
+        .args(["check", db.to_str().unwrap(), "t"])
+        .env_remove("ICEFALLDB_KEY_T_V1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "check failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("check passed"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("ENCRYPTION_KEY_UNAVAILABLE"),
+        "expected encryption-specific message: {stdout}"
+    );
+}
+
+#[test]
 fn rejects_encrypt_and_encrypt_column_together() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("db");

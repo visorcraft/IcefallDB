@@ -96,7 +96,14 @@ enum Commands {
         file: PathBuf,
     },
     /// Validate a IcefallDB table.
-    Check { db: PathBuf, table: String },
+    Check {
+        db: PathBuf,
+        table: String,
+        /// JSON key file for reading an encrypted table. Default: read keys
+        /// from `ICEFALLDB_KEY_*` environment variables.
+        #[arg(long, value_name = "PATH")]
+        key_file: Option<PathBuf>,
+    },
     /// Diagnose and optionally repair a IcefallDB table.
     Doctor {
         db: PathBuf,
@@ -339,7 +346,7 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        Commands::Check { db, table } => match run_check(&db, &table).await {
+        Commands::Check { db, table, key_file } => match run_check(&db, &table, key_file.as_deref()).await {
             Ok(result) => {
                 print_issues(&result);
                 if result.passed {
@@ -493,12 +500,16 @@ fn main() -> ExitCode {
                         for action in &result.actions {
                             println!("{} {}: {}", action.kind, action.path, action.detail);
                         }
-                        if result.repaired {
+                        if !result.healthy {
+                            println!("unrepairable issues remain");
+                            ExitCode::from(1)
+                        } else if result.repaired {
                             println!("repaired");
+                            ExitCode::from(0)
                         } else {
                             println!("no repairs needed");
+                            ExitCode::from(0)
                         }
-                        ExitCode::from(0)
                     }
                     Err(e) => {
                         eprintln!("icefalldb doctor failed: {:#}", e);
@@ -1486,10 +1497,26 @@ async fn run_create_index(
     Ok(())
 }
 
-async fn run_check(db: &Path, table: &str) -> icefalldb_core::Result<CheckResult> {
+async fn run_check(
+    db: &Path,
+    table: &str,
+    key_file: Option<&Path>,
+) -> icefalldb_core::Result<CheckResult> {
     validate_table(table)?;
     let storage = LocalStorage::new(db)?;
-    let checker = Checker::new(&storage, table);
+    let options = {
+        #[cfg(feature = "encryption")]
+        {
+            let provider = encryption::provider_from(key_file);
+            icefalldb_core::check::CheckOptions::new().with_key_provider(provider)
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = key_file;
+            icefalldb_core::check::CheckOptions::new()
+        }
+    };
+    let checker = Checker::new_with_options(&storage, table, options);
     checker.check().await
 }
 

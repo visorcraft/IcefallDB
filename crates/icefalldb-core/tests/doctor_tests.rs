@@ -60,6 +60,15 @@ async fn read_latest_sequence(storage: &dyn Storage, table: &str) -> u64 {
     pointer["latest"].as_u64().unwrap()
 }
 
+async fn read_latest_manifest(storage: &dyn Storage, table: &str) -> Manifest {
+    let seq = read_latest_sequence(storage, table).await;
+    let data = storage
+        .read(&format!("{}/{}", table, Manifest::filename(seq)))
+        .await
+        .unwrap();
+    serde_json::from_slice(&data).unwrap()
+}
+
 #[tokio::test]
 async fn test_doctor_no_op_on_healthy_table() {
     let (storage, table) = setup_committed_table().await;
@@ -708,4 +717,65 @@ async fn test_doctor_preserves_files_referenced_by_older_snapshot() {
             .any(|a| a.path == manifest_v1.row_groups[0].data),
         "expected Skipped action for older data file"
     );
+}
+
+#[tokio::test]
+async fn test_doctor_repair_regenerates_missing_row_group_meta() {
+    let (storage, table) = setup_committed_table().await;
+    let manifest = read_latest_manifest(storage.as_ref(), &table).await;
+    let meta_path = format!("{}/{}", table, manifest.row_groups[0].meta);
+
+    storage.delete(&meta_path).await.unwrap();
+
+    // `check` should report the missing sidecar before repair.
+    let check_before = icefalldb_core::Checker::new(storage.as_ref(), &table)
+        .check()
+        .await
+        .unwrap();
+    assert!(!check_before.passed);
+    assert!(check_before
+        .issues
+        .iter()
+        .any(|i| i.code == "MISSING_ROW_GROUP_META"));
+
+    let doctor = Doctor::new(storage.as_ref(), &table);
+    let result = doctor.repair().await.unwrap();
+
+    assert!(result.repaired, "expected a repair action");
+    assert!(result.healthy, "repair should leave the table healthy");
+    assert!(
+        result
+            .actions
+            .iter()
+            .any(|a| a.kind == ActionKind::Regenerated && a.path == manifest.row_groups[0].meta),
+        "expected Regenerated action for missing meta"
+    );
+    assert!(
+        storage.exists(&meta_path).await.unwrap(),
+        "regenerated meta file should exist"
+    );
+
+    let check_after = icefalldb_core::Checker::new(storage.as_ref(), &table)
+        .check()
+        .await
+        .unwrap();
+    assert!(check_after.passed, "issues: {:?}", check_after.issues);
+}
+
+#[tokio::test]
+async fn test_doctor_diagnose_reports_missing_row_group_meta() {
+    let (storage, table) = setup_committed_table().await;
+    let manifest = read_latest_manifest(storage.as_ref(), &table).await;
+    let meta_path = format!("{}/{}", table, manifest.row_groups[0].meta);
+
+    storage.delete(&meta_path).await.unwrap();
+
+    let doctor = Doctor::new(storage.as_ref(), &table);
+    let result = doctor.diagnose().await.unwrap();
+
+    assert!(!result.healthy);
+    assert!(result
+        .issues
+        .iter()
+        .any(|i| i.kind == DiagnosisKind::MissingRowGroupMeta));
 }

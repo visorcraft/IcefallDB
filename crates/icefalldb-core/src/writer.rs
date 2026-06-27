@@ -5414,6 +5414,91 @@ pub fn compute_row_group_meta(
     Ok(meta)
 }
 
+/// Best-effort regeneration of a `.meta` sidecar from the Parquet footer.
+///
+/// Used by [`crate::doctor::Doctor`] to recreate a missing row-group metadata
+/// file. Statistics are derived from footer column-chunk statistics; encrypted
+/// columns (when known) are skipped so the regenerated plaintext sidecar does
+/// not leak protected values. Row-ID segments cannot be recovered from the
+/// footer and are left empty.
+pub fn compute_row_group_meta_from_footer(
+    rg_id: &str,
+    schema_id: u64,
+    schema: &Schema,
+    parquet_bytes: &[u8],
+    parquet_metadata: &parquet::file::metadata::ParquetMetaData,
+    encrypted_columns: &std::collections::HashSet<String>,
+) -> Result<RowGroupMeta> {
+    let columns = derive_footer_stats_for_repair(schema, parquet_metadata, encrypted_columns)?;
+    let column_offsets = compute_column_offsets(parquet_metadata, schema);
+    let mut meta = RowGroupMeta {
+        row_group: rg_id.to_string(),
+        schema_id,
+        rows: parquet_metadata.file_metadata().num_rows() as usize,
+        columns,
+        column_offsets,
+        sort: schema.sort.clone(),
+        row_ids: vec![],
+        checksum: String::new(),
+        meta_checksum: String::new(),
+    };
+    meta.compute_checksum(parquet_bytes)?;
+    Ok(meta)
+}
+
+/// Derive column statistics from the Parquet footer for repair purposes.
+///
+/// Unlike the fast-path [`Writer::derive_footer_stats`], this function is
+/// best-effort: unsupported columns are omitted, and missing min/max are
+/// represented as `None`. Encrypted columns are skipped entirely.
+fn derive_footer_stats_for_repair(
+    schema: &Schema,
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    encrypted_columns: &std::collections::HashSet<String>,
+) -> Result<HashMap<String, ColumnStats>> {
+    let schema_descr = metadata.file_metadata().schema_descr();
+    let mut columns = HashMap::new();
+
+    for col in &schema.columns {
+        if encrypted_columns.contains(&col.name) {
+            continue;
+        }
+        let arrow_type = match icefalldb_type_to_arrow(&col.r#type) {
+            Some(t) => t,
+            None => continue,
+        };
+        let leaf_idx = match schema_descr
+            .columns()
+            .iter()
+            .position(|c| c.name() == col.name)
+        {
+            Some(i) => i,
+            None => continue,
+        };
+
+        let mut nulls: usize = 0;
+        let mut min: Option<serde_json::Value> = None;
+        let mut max: Option<serde_json::Value> = None;
+
+        for rg in metadata.row_groups() {
+            let col_meta = rg.column(leaf_idx);
+            let Some(stats) = col_meta.statistics() else {
+                continue;
+            };
+            nulls += stats.null_count_opt().unwrap_or(0) as usize;
+            if is_supported_footer_stat_type(&arrow_type) {
+                let (rg_min, rg_max) = parquet_stats_to_json(stats, &arrow_type)?;
+                min = min_json(min, rg_min);
+                max = max_json(max, rg_max);
+            }
+        }
+
+        columns.insert(col.name.clone(), ColumnStats { min, max, nulls });
+    }
+
+    Ok(columns)
+}
+
 /// Read a `.meta` sidecar and return its row count if it is valid.
 async fn read_meta_rows(storage: &dyn Storage, meta_path: &str) -> Option<usize> {
     match storage.read(meta_path).await {

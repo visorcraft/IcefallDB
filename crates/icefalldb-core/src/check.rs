@@ -6,8 +6,21 @@ use crate::Result;
 use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
 use bytes::Bytes;
+#[cfg(feature = "encryption")]
+use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::HashSet;
+
+#[cfg(feature = "encryption")]
+use {
+    crate::encryption::provider::KeyProvider,
+    crate::encryption::{
+        build_decryption_properties, table_aad_prefix, EncryptionKeySet, KeyIdentifier,
+        SchemaEncryptionMarker,
+    },
+    base64::Engine,
+    std::sync::Arc,
+};
 
 /// Severity level of a [`CheckIssue`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +46,48 @@ pub struct CheckResult {
     pub issues: Vec<CheckIssue>,
 }
 
+/// Options controlling how a table check behaves.
+#[derive(Clone, Default)]
+pub struct CheckOptions {
+    /// Optional key provider used to decrypt Parquet Modular Encryption tables.
+    /// When `None` (the default), encrypted tables are still validated at the
+    /// metadata/checksum level, but data-page validation is skipped.
+    #[cfg(feature = "encryption")]
+    pub key_provider: Option<Arc<dyn KeyProvider>>,
+}
+
+impl std::fmt::Debug for CheckOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(feature = "encryption")]
+        {
+            f.debug_struct("CheckOptions")
+                .field(
+                    "key_provider",
+                    &self.key_provider.as_ref().map(|_| "**REDACTED**"),
+                )
+                .finish()
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            f.debug_struct("CheckOptions").finish()
+        }
+    }
+}
+
+impl CheckOptions {
+    /// Default options: no key provider.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Provide a key provider so the checker can decrypt encrypted row groups.
+    #[cfg(feature = "encryption")]
+    pub fn with_key_provider(mut self, provider: Arc<dyn KeyProvider>) -> Self {
+        self.key_provider = Some(provider);
+        self
+    }
+}
+
 /// How to report a declared column that is absent from the Parquet file.
 enum MissingColumnHandling {
     /// Any missing declared column is an error.
@@ -46,14 +101,27 @@ enum MissingColumnHandling {
 pub struct Checker<'a> {
     storage: &'a dyn Storage,
     table: String,
+    #[cfg(feature = "encryption")]
+    options: CheckOptions,
 }
 
 impl<'a> Checker<'a> {
     /// Create a new checker for `table` using `storage`.
     pub fn new(storage: &'a dyn Storage, table: &str) -> Self {
+        Self::new_with_options(storage, table, CheckOptions::default())
+    }
+
+    /// Create a new checker with the supplied options.
+    pub fn new_with_options(
+        storage: &'a dyn Storage,
+        table: &str,
+        #[cfg_attr(not(feature = "encryption"), allow(unused_variables))] options: CheckOptions,
+    ) -> Self {
         Self {
             storage,
             table: table.to_string(),
+            #[cfg(feature = "encryption")]
+            options,
         }
     }
 
@@ -177,6 +245,91 @@ impl<'a> Checker<'a> {
         } else {
             format!("{}/{}", self.table, rel)
         }
+    }
+
+    #[cfg(feature = "encryption")]
+    async fn read_encryption_marker(
+        &self,
+        schema_id: u64,
+    ) -> Result<Option<SchemaEncryptionMarker>> {
+        let path = self.path("_encryption.json");
+        let bytes = match self.storage.read(&path).await {
+            Ok(b) => b,
+            Err(crate::IcefallDBError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let marker: SchemaEncryptionMarker = serde_json::from_slice(&bytes).map_err(|e| {
+            crate::IcefallDBError::Encryption(format!(
+                "failed to parse _encryption.json for table '{}': {}",
+                self.table, e
+            ))
+        })?;
+        marker.validate().map_err(|e| {
+            crate::IcefallDBError::Encryption(format!(
+                "invalid _encryption.json for table '{}': {}",
+                self.table, e
+            ))
+        })?;
+        // A mismatched AAD prefix is a serious integrity problem; report it as
+        // an error rather than silently skipping encrypted validation.
+        let expected_aad = table_aad_prefix(&self.table, schema_id);
+        let stored_aad = marker
+            .aad_prefix
+            .as_ref()
+            .map(|b64| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        if !stored_aad.is_empty() && stored_aad != expected_aad {
+            return Err(crate::IcefallDBError::Encryption(format!(
+                "_encryption.json AAD prefix does not match table '{}': expected {:?}, got {:?}",
+                self.table, expected_aad, stored_aad
+            )));
+        }
+        Ok(Some(marker))
+    }
+
+    #[cfg(feature = "encryption")]
+    async fn resolve_decryption_properties(
+        &self,
+        marker: &SchemaEncryptionMarker,
+        provider: &dyn KeyProvider,
+        schema_id: u64,
+    ) -> Result<Option<std::sync::Arc<parquet::encryption::decrypt::FileDecryptionProperties>>>
+    {
+        let aad = match &marker.aad_prefix {
+            Some(b64) => base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| crate::IcefallDBError::Encryption(format!("invalid AAD: {e}")))?,
+            None => table_aad_prefix(&self.table, schema_id),
+        };
+
+        let footer_id = KeyIdentifier::new(marker.footer_key_id.clone());
+        let footer_key = match provider.get(&footer_id, &aad).await {
+            Ok(k) => k,
+            Err(crate::IcefallDBError::EncryptionKeyNotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        let mut col_keys = std::collections::BTreeMap::new();
+        for (col, kid) in &marker.column_key_ids {
+            let key = match provider.get(&KeyIdentifier::new(kid.clone()), &aad).await {
+                Ok(k) => k,
+                Err(crate::IcefallDBError::EncryptionKeyNotFound(_)) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            col_keys.insert(col.clone(), key.as_slice().to_vec());
+        }
+
+        let keyset = if col_keys.is_empty() {
+            EncryptionKeySet::footer_only(footer_key.as_slice().to_vec(), aad)?
+        } else {
+            EncryptionKeySet::with_columns(footer_key.as_slice().to_vec(), col_keys, aad)?
+        };
+
+        Ok(Some(build_decryption_properties(&keyset)?))
     }
 
     async fn check_manifest_pointer(&self, issues: &mut Vec<CheckIssue>) -> Result<Option<u64>> {
@@ -382,6 +535,45 @@ impl<'a> Checker<'a> {
     ) -> Result<HashSet<String>> {
         let mut referenced = HashSet::new();
 
+        #[cfg(feature = "encryption")]
+        let encryption_marker = self.read_encryption_marker(manifest.schema_id).await?;
+        #[cfg(not(feature = "encryption"))]
+        let _encryption_marker: Option<()> = None;
+
+        #[cfg(feature = "encryption")]
+        let (decryption_props, encryption_keys_unavailable) = if let Some(marker) =
+            encryption_marker.as_ref()
+        {
+            if let Some(provider) = self.options.key_provider.as_ref() {
+                match self
+                    .resolve_decryption_properties(marker, provider.as_ref(), manifest.schema_id)
+                    .await
+                {
+                    Ok(Some(props)) => (Some(props), false),
+                    Ok(None) | Err(_) => (None, true),
+                }
+            } else {
+                (None, true)
+            }
+        } else {
+            (None, false)
+        };
+        #[cfg(not(feature = "encryption"))]
+        let (_decryption_props, encryption_keys_unavailable) = (None::<std::sync::Arc<()>>, false);
+
+        #[cfg(feature = "encryption")]
+        if encryption_keys_unavailable {
+            issues.push(CheckIssue {
+                severity: Severity::Info,
+                code: "ENCRYPTION_KEY_UNAVAILABLE".into(),
+                message: format!(
+                    "encryption keys unavailable for table '{}'; \
+                     data-page validation skipped for encrypted row groups",
+                    self.table
+                ),
+            });
+        }
+
         for entry in &manifest.row_groups {
             referenced.insert(entry.data.clone());
             referenced.insert(entry.meta.clone());
@@ -496,7 +688,21 @@ impl<'a> Checker<'a> {
             }
 
             let parquet_bytes = Bytes::from(parquet_bytes);
-            match ParquetRecordBatchReaderBuilder::try_new(parquet_bytes) {
+            let builder_result = {
+                #[cfg(feature = "encryption")]
+                if let Some(props) = decryption_props.as_ref() {
+                    ParquetRecordBatchReaderBuilder::try_new_with_options(
+                        parquet_bytes.clone(),
+                        ArrowReaderOptions::new().with_file_decryption_properties(props.clone()),
+                    )
+                } else {
+                    ParquetRecordBatchReaderBuilder::try_new(parquet_bytes.clone())
+                }
+                #[cfg(not(feature = "encryption"))]
+                ParquetRecordBatchReaderBuilder::try_new(parquet_bytes.clone())
+            };
+
+            match builder_result {
                 Ok(builder) => {
                     let file_schema = builder.schema().clone();
                     let issues_before = issues.len();
@@ -543,6 +749,12 @@ impl<'a> Checker<'a> {
                         continue;
                     }
 
+                    // When keys are unavailable, validate the schema from the
+                    // plaintext footer but skip reading/decrypting data pages.
+                    if encryption_keys_unavailable {
+                        continue;
+                    }
+
                     match builder.build() {
                         Ok(reader) => {
                             let batches: Vec<RecordBatch> =
@@ -575,6 +787,12 @@ impl<'a> Checker<'a> {
                     }
                 }
                 Err(e) => {
+                    if encryption_keys_unavailable {
+                        // Encrypted footer (or other key-related failure): the
+                        // metadata/checksum checks above already validated what
+                        // we can without keys. Do not report a spurious error.
+                        continue;
+                    }
                     issues.push(CheckIssue {
                         severity: Severity::Error,
                         code: "PARQUET_OPEN_ERROR".into(),
