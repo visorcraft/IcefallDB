@@ -13,7 +13,7 @@ struct Args {
     #[arg(short, long, default_value = "8080")]
     port: u16,
     /// Host to bind to.
-    #[arg(short, long, default_value = "127.0.0.1")]
+    #[arg(short = 'H', long, default_value = "127.0.0.1")]
     host: String,
     /// Result-cache budget in MiB stored under `<db>/_query_cache` (0 = disabled).
     #[arg(long, default_value = "1024")]
