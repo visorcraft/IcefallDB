@@ -1650,13 +1650,18 @@ pub async fn execute_sql_batch(
                 // fails to read it. The public provider (single-statement path) is
                 // immune because it is always registered under the canonical name.
                 let canonical = original.table().to_string();
-                let provider = Arc::new(IcefallDBTableProvider::from_snapshot(
+                let mut write_provider = IcefallDBTableProvider::from_snapshot(
                     Arc::clone(&storage),
                     canonical,
                     *original.config(),
                     snapshot,
                     Some((pinned, base_plan)),
-                ));
+                );
+                #[cfg(feature = "encryption")]
+                if let Some(resolver) = original.encryption_resolver() {
+                    write_provider = write_provider.with_encryption_resolver(resolver);
+                }
+                let provider = Arc::new(write_provider);
                 write_ctx
                     .register_table(table.as_str(), provider.clone())
                     .map_err(|e| QueryError::Other(format!("register write provider: {e}")))?;

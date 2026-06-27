@@ -107,6 +107,14 @@ pub async fn write_config(
     Ok(cfg)
 }
 
+fn marker_to_key_ids(marker: &SchemaEncryptionMarker) -> BTreeMap<String, KeyIdentifier> {
+    marker
+        .column_key_ids
+        .iter()
+        .map(|(col, kid)| (col.clone(), KeyIdentifier::new(kid.clone())))
+        .collect()
+}
+
 /// Open an encrypted table provider for reading, resolving its key identifiers
 /// from the on-disk marker and the supplied key provider.
 pub async fn open_encrypted_provider(
@@ -117,11 +125,7 @@ pub async fn open_encrypted_provider(
     marker: &SchemaEncryptionMarker,
 ) -> Result<IcefallDBTableProvider> {
     let footer_id = KeyIdentifier::new(marker.footer_key_id.clone());
-    let column_key_ids: BTreeMap<String, KeyIdentifier> = marker
-        .column_key_ids
-        .iter()
-        .map(|(col, kid)| (col.clone(), KeyIdentifier::new(kid.clone())))
-        .collect();
+    let column_key_ids = marker_to_key_ids(marker);
     IcefallDBTableProvider::new_encrypted(
         Arc::clone(storage),
         table,
@@ -132,4 +136,28 @@ pub async fn open_encrypted_provider(
     )
     .await
     .map_err(|e| anyhow!("opening encrypted table '{table}': {e}"))
+}
+
+/// Open an encrypted table provider pinned to a historical snapshot.
+pub async fn open_encrypted_provider_at_snapshot(
+    storage: &Arc<dyn Storage>,
+    table: &str,
+    provider_config: ProviderConfig,
+    key_provider: Arc<dyn KeyProvider>,
+    marker: &SchemaEncryptionMarker,
+    sequence: u64,
+) -> Result<IcefallDBTableProvider> {
+    let footer_id = KeyIdentifier::new(marker.footer_key_id.clone());
+    let column_key_ids = marker_to_key_ids(marker);
+    IcefallDBTableProvider::new_encrypted_at_snapshot(
+        Arc::clone(storage),
+        table,
+        provider_config,
+        key_provider,
+        footer_id,
+        column_key_ids,
+        sequence,
+    )
+    .await
+    .map_err(|e| anyhow!("opening encrypted table '{table}' at snapshot {sequence}: {e}"))
 }

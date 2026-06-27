@@ -132,3 +132,50 @@ def test_no_plaintext_result_cache_for_encrypted(tmp_path, monkeypatch):
     cache = db / "_query_cache"
     leaked = list(cache.glob("*.arrow")) if cache.exists() else []
     assert leaked == [], f"encrypted query wrote plaintext cache files: {leaked}"
+
+
+def test_per_column_plaintext_query_without_column_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("ICEFALLDB_CLI", _CLI)
+    monkeypatch.setenv("ICEFALLDB_KEY_PEOPLE_V1", KEY)
+    db = tmp_path / "db"
+    tsv = tmp_path / "people.tsv"
+    tsv.write_text("name\tssn\nalice\t111-22-3333\nbob\t444-55-6666\n")
+    # Import with per-column encryption on `ssn`; both keys present for writing.
+    monkeypatch.setenv(
+        "ICEFALLDB_KEY_PEOPLE_V1_SSN", "0f0e0d0c0b0a09080706050403020100"
+    )
+    icefalldb.import_tsv(str(db), "people", str(tsv), encrypt_columns=["ssn"])
+    monkeypatch.delenv("ICEFALLDB_KEY_PEOPLE_V1_SSN")
+
+    # Reading the plaintext `name` column should succeed with only the footer key.
+    con = icefalldb.attach(str(db), engine="datafusion")
+    rows = con.sql("SELECT name FROM people ORDER BY name").fetchall()
+    assert rows == [("alice",), ("bob",)]
+
+    # Reading the encrypted `ssn` column without its key must fail.
+    with pytest.raises(Exception):
+        con.sql("SELECT ssn FROM people").fetchall()
+
+
+def test_encrypted_table_time_travel_is_read_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("ICEFALLDB_CLI", _CLI)
+    monkeypatch.setenv("ICEFALLDB_KEY_ORDERS_V1", KEY)
+    db = tmp_path / "db"
+    tsv1 = tmp_path / "orders1.tsv"
+    tsv2 = tmp_path / "orders2.tsv"
+    tsv1.write_text("order_id\tcategory\tamount\n1\tbooks\t9.99\n")
+    tsv2.write_text("order_id\tcategory\tamount\n2\tgames\t39.50\n")
+
+    icefalldb.import_tsv(str(db), "orders", str(tsv1), encrypt=True)
+    icefalldb.import_tsv(str(db), "orders", str(tsv2), encrypt=True)
+
+    latest = icefalldb.attach(str(db), engine="datafusion")
+    asof = icefalldb.attach(str(db), engine="datafusion", snapshot=1)
+
+    latest_count = latest.sql("SELECT COUNT(*) FROM orders").fetchall()[0][0]
+    asof_count = asof.sql("SELECT COUNT(*) FROM orders").fetchall()[0][0]
+    assert latest_count == 2
+    assert asof_count == 1
+
+    with pytest.raises(Exception):
+        asof.mutate("DELETE FROM orders WHERE order_id = 1")

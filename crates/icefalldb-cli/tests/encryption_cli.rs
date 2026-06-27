@@ -333,3 +333,164 @@ fn rejects_encrypt_and_encrypt_column_together() {
     );
     assert!(String::from_utf8_lossy(&out.stderr).contains("not both"));
 }
+
+#[test]
+fn per_column_encryption_plaintext_column_query_needs_no_column_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("db");
+    let tsv = tmp.path().join("t.tsv");
+    std::fs::write(&tsv, "id\tsecret\n1\talpha\n2\tbeta\n").unwrap();
+    let key = "000102030405060708090a0b0c0d0e0f";
+
+    // Import with per-column encryption on `secret`; both keys present.
+    let imp = Command::new(bin())
+        .args([
+            "import",
+            db.to_str().unwrap(),
+            "t",
+            tsv.to_str().unwrap(),
+            "--encrypt-column",
+            "secret",
+        ])
+        .env("ICEFALLDB_KEY_T_V1", key)
+        .env("ICEFALLDB_KEY_T_V1_SECRET", key)
+        .output()
+        .unwrap();
+    assert!(
+        imp.status.success(),
+        "import: {}",
+        String::from_utf8_lossy(&imp.stderr)
+    );
+
+    let table_dir = db.join("t");
+
+    // Query only the plaintext `id` column with only the footer key.
+    let out = Command::new(bin())
+        .args([
+            "query",
+            table_dir.to_str().unwrap(),
+            "SELECT id FROM t ORDER BY id",
+            "--format",
+            "csv",
+        ])
+        .env("ICEFALLDB_KEY_T_V1", key)
+        .env_remove("ICEFALLDB_KEY_T_V1_SECRET")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "plaintext-column query failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1"), "missing row 1: {stdout}");
+    assert!(stdout.contains("2"), "missing row 2: {stdout}");
+
+    // Querying the encrypted column without its key must fail.
+    let out = Command::new(bin())
+        .args(["query", table_dir.to_str().unwrap(), "SELECT secret FROM t"])
+        .env("ICEFALLDB_KEY_T_V1", key)
+        .env_remove("ICEFALLDB_KEY_T_V1_SECRET")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "encrypted-column query without key unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("secret")
+            || stderr.contains("EncryptionKeyNotFound")
+            || stderr.contains("No column decryption key"),
+        "expected missing-key error, got: {stderr}"
+    );
+}
+
+#[test]
+fn encrypted_table_snapshot_time_travel_is_read_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("db");
+    let tsv1 = tmp.path().join("t1.tsv");
+    let tsv2 = tmp.path().join("t2.tsv");
+    std::fs::write(&tsv1, "id\tname\n1\ta\n").unwrap();
+    std::fs::write(&tsv2, "id\tname\n2\tb\n").unwrap();
+    let key = "000102030405060708090a0b0c0d0e0f";
+
+    // Two imports produce snapshot 1 (one row) and snapshot 2 (two rows).
+    for tsv in [&tsv1, &tsv2] {
+        let imp = Command::new(bin())
+            .args([
+                "import",
+                db.to_str().unwrap(),
+                "t",
+                tsv.to_str().unwrap(),
+                "--encrypt",
+            ])
+            .env("ICEFALLDB_KEY_T_V1", key)
+            .output()
+            .unwrap();
+        assert!(
+            imp.status.success(),
+            "import: {}",
+            String::from_utf8_lossy(&imp.stderr)
+        );
+    }
+
+    let table_dir = db.join("t");
+
+    let latest = Command::new(bin())
+        .args([
+            "query",
+            table_dir.to_str().unwrap(),
+            "SELECT COUNT(*) FROM t",
+        ])
+        .env("ICEFALLDB_KEY_T_V1", key)
+        .output()
+        .unwrap();
+    assert!(
+        latest.status.success(),
+        "latest query: {}",
+        String::from_utf8_lossy(&latest.stderr)
+    );
+
+    let asof = Command::new(bin())
+        .args([
+            "query",
+            table_dir.to_str().unwrap(),
+            "SELECT COUNT(*) FROM t",
+            "--snapshot",
+            "1",
+        ])
+        .env("ICEFALLDB_KEY_T_V1", key)
+        .output()
+        .unwrap();
+    assert!(
+        asof.status.success(),
+        "snapshot query failed: {}",
+        String::from_utf8_lossy(&asof.stderr)
+    );
+    assert_ne!(
+        String::from_utf8_lossy(&latest.stdout).trim(),
+        String::from_utf8_lossy(&asof.stdout).trim(),
+        "snapshot 1 must differ from latest"
+    );
+
+    // Mutations on a snapshot-pinned encrypted table are rejected.
+    let del = Command::new(bin())
+        .args([
+            "query",
+            table_dir.to_str().unwrap(),
+            "DELETE FROM t WHERE id = 1",
+            "--snapshot",
+            "1",
+        ])
+        .env("ICEFALLDB_KEY_T_V1", key)
+        .output()
+        .unwrap();
+    assert!(!del.status.success(), "DELETE on snapshot should fail");
+    let stderr = String::from_utf8_lossy(&del.stderr);
+    assert!(
+        stderr.contains("read-only") || stderr.contains("--snapshot"),
+        "expected read-only error, got: {stderr}"
+    );
+}

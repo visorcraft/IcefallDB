@@ -20,7 +20,7 @@ use datafusion::execution::TaskContext;
 use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{
-    BinaryExpr, Expr, Operator, TableProviderFilterPushDown, TableType,
+    utils::expr_to_columns, BinaryExpr, Expr, Operator, TableProviderFilterPushDown, TableType,
 };
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_expr::expressions::Column;
@@ -161,17 +161,18 @@ pub struct IcefallDBTableProvider {
     /// perform exactly one refresh.
     #[cfg(test)]
     apply_delta_count: Arc<AtomicU64>,
-    /// Optional decryption properties built at construction time from a
-    /// `KeyProvider`. When `Some`, the custom scan path uses these to decrypt
-    /// Parquet data via `ArrowReaderOptions::with_file_decryption_properties`.
+    /// Lazy encryption key resolver. When `Some`, the table is encrypted and
+    /// the custom scan path fetches keys on demand for the columns that are
+    /// actually projected or filtered, rather than resolving every per-column
+    /// key at provider-open time.
     ///
-    /// The native `ParquetSource` scan path is *not* used when these are set;
+    /// The native `ParquetSource` scan path is *not* used when this is set;
     /// see `scan()` for the rationale. When the encryption feature is enabled
     /// but the user also wants to use the native scan path for plaintext
     /// tables, they should construct two providers (one plaintext via `new`,
     /// one encrypted via `new_encrypted`).
     #[cfg(feature = "encryption")]
-    decryption_properties: Option<Arc<parquet::encryption::decrypt::FileDecryptionProperties>>,
+    encryption_resolver: Option<Arc<crate::encryption::EncryptionKeyResolver>>,
 }
 
 /// Build the full schema that is advertised to DataFusion by appending the
@@ -480,7 +481,7 @@ impl IcefallDBTableProvider {
             #[cfg(test)]
             apply_delta_count: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "encryption")]
-            decryption_properties: None,
+            encryption_resolver: None,
         }
     }
 
@@ -489,12 +490,13 @@ impl IcefallDBTableProvider {
         self.snapshot_read().clone()
     }
 
-    /// Open an encrypted IcefallDB table, resolving the table's keys via the
-    /// given `KeyProvider`.
+    /// Open an encrypted IcefallDB table, deferring per-column key resolution
+    /// until a query actually references an encrypted column.
     ///
     /// The caller must know the key identifiers (e.g. from `_encryption.json`)
-    /// and pass them in. The provider is queried once at construction; the
-    /// resolved key set is held for the lifetime of the provider.
+    /// and pass them in. The footer key is still resolved at scan time, but
+    /// per-column keys are fetched from the `KeyProvider` lazily based on the
+    /// projected and filtered columns.
     ///
     /// The AAD prefix is loaded from the stored `_encryption.json` marker
     /// (rather than recomputed from a hardcoded schema id) so this constructor
@@ -514,23 +516,104 @@ impl IcefallDBTableProvider {
         >,
     ) -> Result<Self> {
         let table_str: String = table.into();
-        let aad = read_table_aad_prefix(&storage, &table_str).await?;
-        let keys = crate::encryption::load_table_keys(
-            provider.as_ref(),
-            &footer_key_id.into(),
-            &column_key_ids,
-            &aad,
-        )
-        .await?;
-        let dec = crate::encryption::build_decryption_properties_for_table(&keys)?;
+        let (aad, plaintext_footer) = read_encryption_marker(&storage, &table_str).await?;
+
+        let resolver = crate::encryption::EncryptionKeyResolver::new(
+            provider,
+            footer_key_id.into(),
+            column_key_ids,
+            aad,
+            plaintext_footer,
+        );
 
         // We do NOT register the encryption factory on the session here: the
         // caller does that separately via `icefalldb_encrypted_session(...)`.
-        // The provider just holds the pre-resolved decryption properties, which
-        // the custom scan path uses directly. This avoids the per-scan key
-        // lookup that the factory mechanism would require.
+        // The provider holds a lazy key resolver; the custom scan path resolves
+        // keys on demand for the columns that are actually read.
         let mut provider = Self::new(Arc::clone(&storage), table_str, config).await?;
-        provider.decryption_properties = Some(dec);
+        provider.encryption_resolver = Some(Arc::new(resolver));
+        Ok(provider)
+    }
+
+    /// Open an encrypted IcefallDB table pinned to a specific historical
+    /// snapshot, with lazy per-column key resolution.
+    ///
+    /// This is the time-travel equivalent of [`Self::new_encrypted`]: it uses
+    /// the retained manifest at `sequence` and the table's current
+    /// `_encryption.json` marker / key provider. The resulting provider is
+    /// read-only.
+    #[cfg(feature = "encryption")]
+    pub async fn new_encrypted_at_snapshot(
+        storage: Arc<dyn Storage>,
+        table: impl Into<String>,
+        config: ProviderConfig,
+        provider: std::sync::Arc<dyn icefalldb_core::encryption::provider::KeyProvider>,
+        footer_key_id: impl Into<icefalldb_core::encryption::KeyIdentifier> + Clone,
+        column_key_ids: std::collections::BTreeMap<
+            String,
+            icefalldb_core::encryption::KeyIdentifier,
+        >,
+        sequence: u64,
+    ) -> Result<Self> {
+        let _ = ParquetMetadataCache::global_with_capacity(config.parquet_metadata_cache_capacity);
+
+        let table = table.into();
+        let (aad, plaintext_footer) = read_encryption_marker(&storage, &table).await?;
+
+        let scan_plan = build_scan_plan_at(storage.as_ref(), &table, sequence)
+            .await
+            .map_err(QueryError::Core)?;
+
+        let manifest_path = format!("{}/{}", table, Manifest::filename(sequence));
+        let manifest_bytes = storage
+            .read(&manifest_path)
+            .await
+            .map_err(QueryError::Core)?;
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes).map_err(|e| {
+            QueryError::Other(format!(
+                "parsing manifest at sequence {sequence} for table '{table}': {e}"
+            ))
+        })?;
+
+        let arrow_schema = scan_plan
+            .schema
+            .arrow_schema()
+            .ok_or_else(|| {
+                QueryError::Other(format!(
+                    "table '{}' has a column with an unsupported Arrow type",
+                    table
+                ))
+            })
+            .map(Arc::new)?;
+        let statistics = scan_plan_statistics(&scan_plan, &arrow_schema);
+        let full_schema = make_full_schema(&arrow_schema);
+
+        let indexes =
+            Self::load_snapshot_indexes(storage.as_ref(), &table, Some(&manifest), true).await?;
+
+        let resolver = crate::encryption::EncryptionKeyResolver::new(
+            provider,
+            footer_key_id.into(),
+            column_key_ids,
+            aad,
+            plaintext_footer,
+        );
+
+        let mut provider = Self::from_snapshot(
+            storage,
+            table,
+            config,
+            SnapshotState {
+                arrow_schema,
+                full_schema,
+                scan_plan: scan_plan.clone(),
+                statistics,
+                indexes,
+                pinned_sequence: sequence,
+            },
+            Some((sequence, scan_plan)),
+        );
+        provider.encryption_resolver = Some(Arc::new(resolver));
         Ok(provider)
     }
 
@@ -840,6 +923,27 @@ impl IcefallDBTableProvider {
     /// Return a reference to the provider configuration.
     pub fn config(&self) -> &ProviderConfig {
         &self.config
+    }
+
+    /// Return a clone of the lazy encryption resolver, if this provider was
+    /// opened in encrypted mode.
+    #[cfg(feature = "encryption")]
+    pub(crate) fn encryption_resolver(
+        &self,
+    ) -> Option<Arc<crate::encryption::EncryptionKeyResolver>> {
+        self.encryption_resolver.clone()
+    }
+
+    /// Set the lazy encryption resolver on this provider. Used when cloning a
+    /// provider for the write-side mutation path so the copy retains the same
+    /// encrypted-read semantics as the original.
+    #[cfg(feature = "encryption")]
+    pub(crate) fn with_encryption_resolver(
+        mut self,
+        resolver: Arc<crate::encryption::EncryptionKeyResolver>,
+    ) -> Self {
+        self.encryption_resolver = Some(resolver);
+        self
     }
 
     /// Acquire a read lock on `snapshot`, recovering from poison so a prior
@@ -1528,7 +1632,7 @@ impl TableProvider for IcefallDBTableProvider {
         // per-scan factory configuration that our session does not currently do.
         // We also avoid holding decrypted data in memory longer than necessary.
         #[cfg(feature = "encryption")]
-        let encryption_active = self.decryption_properties.is_some();
+        let encryption_active = self.encryption_resolver.is_some();
         #[cfg(not(feature = "encryption"))]
         let encryption_active = false;
 
@@ -1698,12 +1802,29 @@ impl TableProvider for IcefallDBTableProvider {
             }
         }
 
+        // Resolve decryption keys lazily for the columns this query actually
+        // touches. Plaintext columns on a per-column-encrypted table do not
+        // require the encrypted-column keys.
+        #[cfg(feature = "encryption")]
+        let decryption_properties = if let Some(resolver) = &self.encryption_resolver {
+            let needed_columns =
+                needed_columns_for_encryption(projection, filters, &full_schema, n_data)?;
+            Some(
+                resolver
+                    .resolve_for_columns(&needed_columns)
+                    .await
+                    .map_err(|e: crate::QueryError| DataFusionError::External(Box::new(e)))?,
+            )
+        } else {
+            None
+        };
+
         // Pass `full_schema` to `IcefallDBScanExec` so that projection indices
         // pointing at pseudo-column slots (>= n_data) are correctly resolved to
         // `_rowid`/`_rowaddr` and the scan synthesizes those columns.  The
         // projection vector from DataFusion already uses `full_schema` indices.
         #[cfg(feature = "encryption")]
-        if let Some(dec) = &self.decryption_properties {
+        if let Some(dec) = decryption_properties {
             let exec = IcefallDBScanExec::new_encrypted(
                 Arc::clone(&self.storage),
                 Arc::clone(&full_schema),
@@ -1715,7 +1836,7 @@ impl TableProvider for IcefallDBTableProvider {
                 self.config.io_coalesce_window,
                 self.config.io_concurrency,
                 self.config.target_partitions,
-                Arc::clone(dec),
+                dec,
             )
             .map_err(|e: crate::QueryError| DataFusionError::External(Box::new(e)))?;
             let exec = exec.with_agg_group_keys(self.declared_agg_group_keys());
@@ -1924,32 +2045,77 @@ fn build_native_bulk_decode_plan(
     Ok(plan)
 }
 
-/// Read the AAD prefix for an encrypted table from its `_encryption.json`
-/// marker. Returns an empty `Vec` if the marker is absent or unparseable, in
-/// which case the caller (or the file itself, when `with_aad_prefix_storage(true)`
-/// was used at write time) provides the AAD. A marker that parses cleanly but
+/// Read the encryption marker for a table and return its AAD prefix and
+/// plaintext-footer flag.
+///
+/// Returns an empty AAD if the marker is absent or unparseable, in which case
+/// the caller (or the file itself, when `with_aad_prefix_storage(true)` was
+/// used at write time) provides the AAD. A marker that parses cleanly but
 /// advertises an unknown algorithm is rejected (propagated as an error) rather
 /// than silently treated as decryptable.
 #[cfg(feature = "encryption")]
-async fn read_table_aad_prefix(storage: &Arc<dyn Storage>, table: &str) -> Result<Vec<u8>> {
+async fn read_encryption_marker(
+    storage: &Arc<dyn Storage>,
+    table: &str,
+) -> Result<(Vec<u8>, bool)> {
     use base64::Engine;
     use icefalldb_core::encryption::SchemaEncryptionMarker;
 
     let marker_path = format!("{table}/_encryption.json");
     let bytes = match storage.read(&marker_path).await {
         Ok(b) => b,
-        Err(_) => return Ok(Vec::new()),
+        Err(_) => return Ok((Vec::new(), true)),
     };
     let marker: SchemaEncryptionMarker = match serde_json::from_slice(&bytes) {
         Ok(m) => m,
-        Err(_) => return Ok(Vec::new()),
+        Err(_) => return Ok((Vec::new(), true)),
     };
     // A well-formed marker must advertise a scheme we know how to read.
     marker.validate()?;
-    Ok(marker
+    let aad = marker
         .aad_prefix
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .unwrap_or_default())
+        .unwrap_or_default();
+    Ok((aad, marker.plaintext_footer))
+}
+
+/// Return the set of real (non-pseudo) column names referenced by the
+/// projection and pushed-down filters. Lazy encryption key resolution uses
+/// this to fetch only the per-column keys that are actually needed.
+#[cfg(feature = "encryption")]
+fn needed_columns_for_encryption(
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+    full_schema: &ArrowSchema,
+    n_data_columns: usize,
+) -> datafusion::common::Result<HashSet<String>> {
+    let mut needed = HashSet::new();
+    if let Some(indices) = projection {
+        for &idx in indices {
+            if idx < n_data_columns {
+                needed.insert(full_schema.field(idx).name().clone());
+            }
+        }
+    } else {
+        // No projection means all data columns are potentially read.
+        for field in full_schema.fields().iter().take(n_data_columns) {
+            needed.insert(field.name().clone());
+        }
+    }
+
+    let mut filter_cols = HashSet::new();
+    for filter in filters {
+        expr_to_columns(filter, &mut filter_cols)?;
+    }
+    for col in filter_cols {
+        if let Ok(idx) = full_schema.index_of(col.name()) {
+            if idx < n_data_columns {
+                needed.insert(col.name().to_string());
+            }
+        }
+    }
+
+    Ok(needed)
 }
 
 #[cfg(test)]

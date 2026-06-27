@@ -1896,10 +1896,14 @@ async fn run_query_encrypted(
     snapshot: Option<u64>,
     key_file: Option<&Path>,
 ) -> anyhow::Result<()> {
-    if snapshot.is_some() {
-        anyhow::bail!("time-travel reads (--snapshot) on encrypted tables are not yet supported");
-    }
     let sql_upper = sql.trim_start().to_uppercase();
+    if snapshot.is_some()
+        && (sql_upper.starts_with("DELETE")
+            || sql_upper.starts_with("UPDATE")
+            || sql_upper.starts_with("MERGE"))
+    {
+        anyhow::bail!("--snapshot is read-only; mutations are not allowed on a past snapshot");
+    }
     if sql_upper.starts_with("DELETE")
         || sql_upper.starts_with("UPDATE")
         || sql_upper.starts_with("MERGE")
@@ -1921,20 +1925,49 @@ async fn run_query_encrypted(
     for table in tables {
         validate_table(table)?;
         if let Some(marker) = encryption::read_marker(storage, table).await? {
-            let provider = encryption::open_encrypted_provider(
-                storage,
-                table,
-                provider_config,
-                Arc::clone(&key_provider),
-                &marker,
-            )
-            .await?;
+            let provider = if let Some(seq) = snapshot {
+                encryption::open_encrypted_provider_at_snapshot(
+                    storage,
+                    table,
+                    provider_config,
+                    Arc::clone(&key_provider),
+                    &marker,
+                    seq,
+                )
+                .await?
+            } else {
+                encryption::open_encrypted_provider(
+                    storage,
+                    table,
+                    provider_config,
+                    Arc::clone(&key_provider),
+                    &marker,
+                )
+                .await?
+            };
             ctx.register_table(table, Arc::new(provider))
                 .map_err(|e| anyhow::anyhow!("registering encrypted table '{}': {}", table, e))?;
         } else {
-            let provider = IcefallDBTableProvider::new(Arc::clone(storage), table, provider_config)
+            let provider = if let Some(seq) = snapshot {
+                IcefallDBTableProvider::new_at_snapshot(
+                    Arc::clone(storage),
+                    table,
+                    provider_config,
+                    seq,
+                )
                 .await
-                .with_context(|| format!("loading table '{}'", table))?;
+                .map_err(|e| match e {
+                    QueryError::Core(IcefallDBError::SnapshotNotFound(n)) => {
+                        anyhow::anyhow!("snapshot {} not found for table '{}'", n, table)
+                    }
+                    other => anyhow::anyhow!("{}", other)
+                        .context(format!("loading table '{}' at snapshot {}", table, seq)),
+                })?
+            } else {
+                IcefallDBTableProvider::new(Arc::clone(storage), table, provider_config)
+                    .await
+                    .with_context(|| format!("loading table '{}'", table))?
+            };
             ctx.register_table(table, Arc::new(provider))
                 .map_err(|e| anyhow::anyhow!("registering table '{}': {}", table, e))?;
         }

@@ -162,6 +162,123 @@ pub fn build_decryption_properties_for_table(
     build_decryption_properties(keys).map_err(map_enc_err)
 }
 
+/// Lazy resolver for an encrypted table's decryption properties.
+///
+/// Column keys are fetched from the [`KeyProvider`] only when the column is
+/// actually referenced by a query's projection or filter. This lets
+/// plaintext-column queries on a per-column-encrypted table succeed without
+/// providing keys for columns that are not read.
+#[derive(Clone)]
+pub struct EncryptionKeyResolver {
+    provider: Arc<dyn KeyProvider>,
+    footer_key_id: KeyIdentifier,
+    column_key_ids: std::collections::BTreeMap<String, KeyIdentifier>,
+    aad: Vec<u8>,
+    plaintext_footer: bool,
+}
+
+impl std::fmt::Debug for EncryptionKeyResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionKeyResolver")
+            .field("footer_key_id", &self.footer_key_id)
+            .field(
+                "column_key_ids",
+                &self.column_key_ids.keys().collect::<Vec<_>>(),
+            )
+            .field("plaintext_footer", &self.plaintext_footer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EncryptionKeyResolver {
+    /// Create a resolver for a table's encryption keys.
+    pub fn new(
+        provider: Arc<dyn KeyProvider>,
+        footer_key_id: KeyIdentifier,
+        column_key_ids: std::collections::BTreeMap<String, KeyIdentifier>,
+        aad: Vec<u8>,
+        plaintext_footer: bool,
+    ) -> Self {
+        Self {
+            provider,
+            footer_key_id,
+            column_key_ids,
+            aad,
+            plaintext_footer,
+        }
+    }
+
+    /// Whether the table uses a plaintext Parquet footer.
+    pub fn plaintext_footer(&self) -> bool {
+        self.plaintext_footer
+    }
+
+    /// Resolve the footer key and only the per-column keys for columns named
+    /// in `needed_columns`, then build the corresponding
+    /// `FileDecryptionProperties`.
+    ///
+    /// Columns that are not encrypted (no entry in `column_key_ids`) require no
+    /// key. Missing keys for encrypted columns that *are* needed surface as
+    /// [`IcefallDBError::EncryptionKeyNotFound`].
+    ///
+    /// When the table has a plaintext footer and no encrypted column is
+    /// referenced, the footer key is not required: a dummy key is used and
+    /// footer-signature verification is disabled. This lets plaintext-column
+    /// queries (including `COUNT(*)`) succeed even if the caller only has
+    /// access to the encrypted columns they actually read.
+    pub async fn resolve_for_columns(
+        &self,
+        needed_columns: &std::collections::HashSet<String>,
+    ) -> Result<Arc<parquet::encryption::decrypt::FileDecryptionProperties>> {
+        let needs_any_encrypted_column = needed_columns
+            .iter()
+            .any(|name| self.column_key_ids.contains_key(name));
+
+        let footer = match self.provider.get(&self.footer_key_id, &self.aad).await {
+            Ok(footer) => footer.as_slice().to_vec(),
+            Err(e) => {
+                let is_key_not_found =
+                    matches!(e, icefalldb_core::IcefallDBError::EncryptionKeyNotFound(_));
+                if self.plaintext_footer && !needs_any_encrypted_column && is_key_not_found {
+                    // No decryption is actually required for this query; use a
+                    // dummy footer key and disable signature verification so the
+                    // read can proceed without the footer key.
+                    vec![0u8; 16]
+                } else {
+                    return Err(map_enc_err(e));
+                }
+            }
+        };
+        let disable_footer_verification = footer == vec![0u8; 16];
+
+        let mut column_keys = std::collections::BTreeMap::new();
+        for name in needed_columns {
+            if let Some(kid) = self.column_key_ids.get(name) {
+                let key = self
+                    .provider
+                    .get(kid, &self.aad)
+                    .await
+                    .map_err(map_enc_err)?;
+                column_keys.insert(name.clone(), key.as_slice().to_vec());
+            }
+        }
+
+        let mut builder = parquet::encryption::decrypt::FileDecryptionProperties::builder(footer);
+        if !self.aad.is_empty() {
+            builder = builder.with_aad_prefix(self.aad.clone());
+        }
+        for (name, key) in column_keys {
+            builder = builder.with_column_key(&name, key);
+        }
+        if disable_footer_verification {
+            builder = builder.disable_footer_signature_verification();
+        }
+        builder
+            .build()
+            .map_err(|e| map_enc_err(icefalldb_core::IcefallDBError::Encryption(e.to_string())))
+    }
+}
+
 fn map_enc_err(e: icefalldb_core::IcefallDBError) -> crate::QueryError {
     crate::QueryError::Core(e)
 }

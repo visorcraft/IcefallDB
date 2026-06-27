@@ -178,6 +178,16 @@ async fn read_enc_marker(
     Ok(Some(marker))
 }
 
+fn marker_column_key_ids(
+    marker: &SchemaEncryptionMarker,
+) -> std::collections::BTreeMap<String, KeyIdentifier> {
+    marker
+        .column_key_ids
+        .iter()
+        .map(|(c, k)| (c.clone(), KeyIdentifier::new(k.clone())))
+        .collect()
+}
+
 /// Open an encrypted table provider, resolving its key identifiers from the
 /// on-disk marker and the supplied key provider.
 #[cfg(feature = "encryption")]
@@ -189,11 +199,7 @@ async fn open_encrypted(
     marker: &SchemaEncryptionMarker,
 ) -> PyResult<IcefallDBTableProvider> {
     let footer_id = KeyIdentifier::new(marker.footer_key_id.clone());
-    let column_key_ids: std::collections::BTreeMap<String, KeyIdentifier> = marker
-        .column_key_ids
-        .iter()
-        .map(|(c, k)| (c.clone(), KeyIdentifier::new(k.clone())))
-        .collect();
+    let column_key_ids = marker_column_key_ids(marker);
     IcefallDBTableProvider::new_encrypted(
         Arc::clone(storage),
         table,
@@ -204,6 +210,35 @@ async fn open_encrypted(
     )
     .await
     .map_err(|e| PyRuntimeError::new_err(format!("open encrypted '{table}': {e:?}")))
+}
+
+/// Open an encrypted table provider pinned to a historical snapshot.
+#[cfg(feature = "encryption")]
+async fn open_encrypted_at_snapshot(
+    storage: &Arc<dyn Storage>,
+    table: &str,
+    config: ProviderConfig,
+    key_provider: Arc<dyn KeyProvider>,
+    marker: &SchemaEncryptionMarker,
+    sequence: u64,
+) -> PyResult<IcefallDBTableProvider> {
+    let footer_id = KeyIdentifier::new(marker.footer_key_id.clone());
+    let column_key_ids = marker_column_key_ids(marker);
+    IcefallDBTableProvider::new_encrypted_at_snapshot(
+        Arc::clone(storage),
+        table,
+        config,
+        key_provider,
+        footer_id,
+        column_key_ids,
+        sequence,
+    )
+    .await
+    .map_err(|e| {
+        PyRuntimeError::new_err(format!(
+            "open encrypted '{table}' at snapshot {sequence}: {e:?}"
+        ))
+    })
 }
 
 #[pymethods]
@@ -291,11 +326,6 @@ impl IcefallDBConnection {
                     }
                 }
                 if !markers.is_empty() {
-                    if snapshot.is_some() {
-                        return Err(PyRuntimeError::new_err(
-                            "time-travel reads on encrypted tables are not yet supported",
-                        ));
-                    }
                     let key_provider = build_key_provider(key_file.as_deref());
                     let enc_ctx = icefalldb_encrypted_session(
                         config.target_partitions,
@@ -305,14 +335,44 @@ impl IcefallDBConnection {
                     if !server_mode {
                         for table in &table_names {
                             let provider = if let Some(marker) = markers.get(table) {
-                                open_encrypted(
-                                    &storage,
+                                if let Some(seq) = snapshot {
+                                    open_encrypted_at_snapshot(
+                                        &storage,
+                                        table,
+                                        config,
+                                        Arc::clone(&key_provider),
+                                        marker,
+                                        seq,
+                                    )
+                                    .await?
+                                } else {
+                                    open_encrypted(
+                                        &storage,
+                                        table,
+                                        config,
+                                        Arc::clone(&key_provider),
+                                        marker,
+                                    )
+                                    .await?
+                                }
+                            } else if let Some(seq) = snapshot {
+                                IcefallDBTableProvider::new_at_snapshot(
+                                    Arc::clone(&storage),
                                     table,
                                     config,
-                                    Arc::clone(&key_provider),
-                                    marker,
+                                    seq,
                                 )
-                                .await?
+                                .await
+                                .map_err(|e| match e {
+                                    QueryError::Core(IcefallDBError::SnapshotNotFound(n)) => {
+                                        PyRuntimeError::new_err(format!(
+                                            "snapshot {n} not found for table '{table}'"
+                                        ))
+                                    }
+                                    other => PyRuntimeError::new_err(format!(
+                                        "provider '{table}' at snapshot {seq}: {other:?}"
+                                    )),
+                                })?
                             } else {
                                 IcefallDBTableProvider::new(Arc::clone(&storage), table, config)
                                     .await
