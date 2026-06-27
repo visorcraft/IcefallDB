@@ -6,6 +6,7 @@ use icefalldb_core::storage::local::LocalStorage;
 use icefalldb_core::storage::memory::MemoryStorage;
 use icefalldb_core::storage::Storage;
 use icefalldb_core::writer::Writer;
+use icefalldb_core::Compactor;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -180,4 +181,62 @@ async fn wal_fold_with_sequence_gap_links_to_highest_existing_predecessor() {
     assert!(m3.committed_at.is_some(), "folded manifest is timestamped");
     assert!(m1.verify_checksum().unwrap());
     assert!(m3.verify_checksum().unwrap());
+}
+
+/// `compact`/`optimize` must publish manifests with chain fields populated, just
+/// like normal commits. Regression test for M06.
+#[tokio::test]
+async fn compact_manifest_is_hash_chained_and_timestamped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp.path()).unwrap());
+    let table = "compact_chain";
+
+    // seq 1: a normal insert publishes the genesis manifest.
+    let mut w = Writer::create(Arc::clone(&storage), table, make_schema())
+        .await
+        .unwrap();
+    w.insert_batch(make_batch(vec![1, 2, 3, 4, 5]))
+        .await
+        .unwrap();
+    w.commit().await.unwrap();
+
+    let m1 = load_manifest(&storage, table, 1).await;
+
+    // seq 2: optimize rewrites the single row group and must finalize the new
+    // manifest with parent_hash and committed_at.
+    let compactor = Compactor::with_options(
+        storage.as_ref(),
+        table,
+        icefalldb_core::CompactionOptions {
+            force: true,
+            ..icefalldb_core::CompactionOptions::default()
+        },
+    );
+    let result = compactor.compact().await.unwrap();
+    assert!(
+        result.rewrote,
+        "compactor should have rewritten the row group"
+    );
+
+    let m2 = load_manifest(&storage, table, 2).await;
+    assert!(
+        m2.committed_at.is_some(),
+        "optimized manifest must have committed_at"
+    );
+    assert_eq!(
+        m2.parent_hash.as_ref(),
+        Some(&m1.checksum),
+        "optimized manifest must link to its predecessor"
+    );
+    assert!(m2.verify_checksum().unwrap(), "m2 checksum must verify");
+
+    // The whole retained chain must pass verification.
+    let history = icefalldb_core::verify_history(storage.as_ref(), table)
+        .await
+        .unwrap();
+    assert!(
+        history.intact,
+        "chain must be intact after optimize, got breaks: {:?}",
+        history.breaks
+    );
 }

@@ -143,3 +143,61 @@ async fn snapshots_empty_table_shows_no_snapshots() {
         data_lines.len()
     );
 }
+
+/// After a DELETE, `snapshots` must report live rows (physical minus deleted),
+/// matching the live query count. Regression test for M07.
+#[tokio::test]
+async fn snapshots_shows_live_rows_after_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path();
+    let storage = LocalStorage::new(db).unwrap();
+
+    // Insert 3 rows in a single row group.
+    let mut writer = Writer::new(Arc::new(storage.clone()), "bench", make_schema())
+        .await
+        .unwrap();
+    writer
+        .insert_batch(make_batch(vec![1, 2, 3]))
+        .await
+        .unwrap();
+    writer.commit().await.unwrap();
+
+    // Delete row with id=1 (physical offset 0 in fragment 0).
+    let mut deleter = Writer::new(Arc::new(storage.clone()), "bench", make_schema())
+        .await
+        .unwrap();
+    let mut deletes = std::collections::HashMap::new();
+    deletes.insert(0, vec![0u32]);
+    deleter.commit_deletes(deletes).await.unwrap();
+
+    let db_str = db.to_str().unwrap().to_string();
+
+    // Live query count should be 2.
+    let query_out = run_cli(&[
+        "query",
+        &format!("{}/bench", db_str),
+        "SELECT COUNT(*) FROM bench",
+    ]);
+    assert!(
+        query_out.contains("2"),
+        "live query should return 2, got:\n{query_out}"
+    );
+
+    // Snapshot display should also show 2 rows for the latest snapshot.
+    let out = run_cli(&["snapshots", &db_str, "bench"]);
+    let data_lines: Vec<&str> = out
+        .lines()
+        .filter(|l| {
+            !l.trim().is_empty() && !l.contains("sequence") && !l.contains("pending mutation")
+        })
+        .collect();
+    assert!(
+        !data_lines.is_empty(),
+        "expected at least one snapshot row, got:\n{out}"
+    );
+    let latest_line = data_lines.last().unwrap();
+    assert!(
+        latest_line.contains(" 2 "),
+        "latest snapshot should show 2 live rows, got:\n{out}"
+    );
+}

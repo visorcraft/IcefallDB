@@ -1019,9 +1019,15 @@ async fn build_scan_plan_from(
 pub struct SnapshotInfo {
     pub sequence: u64,
     pub committed_at: Option<String>,
+    /// Live rows (physical rows minus `deleted_count`). For the current
+    /// checkpoint snapshot this folds any pending mutation WAL so it matches the
+    /// live query count; older snapshots reflect their committed deletion state.
     pub rows: u64,
     pub fragments: usize,
     pub parent_hash: Option<String>,
+    /// `true` when the row count was computed by folding pending WAL records
+    /// into the current checkpoint snapshot.
+    pub wal_folded: bool,
 }
 
 /// Build a [`ScanPlan`] for the table as of the snapshot at `sequence`.
@@ -1073,12 +1079,43 @@ pub async fn build_scan_plan_at(
     build_scan_plan_from(storage, table, &manifest, &schema, false).await
 }
 
+/// Physical rows for a manifest, taken from the denormalized `row_counts` when
+/// available.
+fn manifest_physical_rows(m: &crate::metadata::Manifest) -> u64 {
+    m.row_counts
+        .as_ref()
+        .map(|c| c.iter().map(|&r| r as u64).sum())
+        .unwrap_or(0)
+}
+
+/// Live rows for a manifest: physical rows minus `deleted_count` on each row
+/// group entry.
+fn manifest_live_rows(m: &crate::metadata::Manifest) -> u64 {
+    let physical = manifest_physical_rows(m);
+    let deleted: u64 = m.row_groups.iter().map(|e| e.deleted_count).sum();
+    physical.saturating_sub(deleted)
+}
+
+/// Read the `_manifest.json` pointer sequence, if present and valid.
+async fn read_pointer_sequence(storage: &dyn Storage, table: &str) -> Option<u64> {
+    let data = storage
+        .read(&format!("{}/_manifest.json", table))
+        .await
+        .ok()?;
+    let pointer: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    pointer.get("latest").and_then(|v| v.as_u64())
+}
+
 /// Return the list of all on-disk snapshots for `table`, sorted ascending by
 /// sequence number.
 ///
 /// Each entry is populated from the manifest file for that sequence. Manifests
 /// that cannot be read or parsed are silently skipped (consistent with the GC
 /// and doctor behaviour for missing/in-flight files).
+///
+/// Row counts are *live* counts: physical rows minus `deleted_count`. For the
+/// current checkpoint snapshot, any pending mutation WAL records are folded so
+/// the displayed count matches the live query count.
 pub async fn list_snapshots(storage: &dyn Storage, table: &str) -> Result<Vec<SnapshotInfo>> {
     let manifests_dir = format!("{}/_manifests", table);
     let entries = match storage.list(&manifests_dir).await {
@@ -1102,6 +1139,8 @@ pub async fn list_snapshots(storage: &dyn Storage, table: &str) -> Result<Vec<Sn
     }
     seqs.sort_unstable();
 
+    let current_seq = read_pointer_sequence(storage, table).await.unwrap_or(0);
+
     let mut out = Vec::with_capacity(seqs.len());
     for seq in seqs {
         let path = format!("{}/{}", table, crate::metadata::Manifest::filename(seq));
@@ -1114,17 +1153,28 @@ pub async fn list_snapshots(storage: &dyn Storage, table: &str) -> Result<Vec<Sn
             Ok(m) => m,
             Err(_) => continue, // skip invalid manifests
         };
-        let rows = m
-            .row_counts
-            .as_ref()
-            .map(|c| c.iter().map(|&r| r as u64).sum())
-            .unwrap_or(0);
+
+        // For the current checkpoint snapshot, fold any pending WAL so the row
+        // count reflects live, committed deletion state. The physical row count
+        // stays anchored to the checkpoint manifest (the WAL fold drops
+        // `row_counts`); deleted rows come from the folded manifest.
+        let (rows, wal_folded) = if seq == current_seq {
+            let checkpoint_physical = manifest_physical_rows(&m);
+            let live = crate::mutation_wal::live_manifest(storage, table, m.clone()).await?;
+            let deleted: u64 = live.row_groups.iter().map(|e| e.deleted_count).sum();
+            let live_rows = checkpoint_physical.saturating_sub(deleted);
+            (live_rows, live.sequence != m.sequence)
+        } else {
+            (manifest_live_rows(&m), false)
+        };
+
         out.push(SnapshotInfo {
             sequence: m.sequence,
             committed_at: m.committed_at.clone(),
             rows,
             fragments: m.row_groups.len(),
             parent_hash: m.parent_hash.clone(),
+            wal_folded,
         });
     }
     Ok(out)

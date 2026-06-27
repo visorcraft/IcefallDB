@@ -100,9 +100,15 @@ impl<'a> Checker<'a> {
             return Ok(self.result(issues));
         }
 
+        // Load every retained valid manifest up-front so orphan detection can
+        // protect files referenced by older snapshots (not only the latest).
+        let valid_manifests =
+            crate::doctor::retained_valid_manifests(self.storage, &self.table).await?;
+
         let manifest_opt = self.check_manifest(latest, &mut issues).await?;
         let Some(manifest) = manifest_opt else {
-            self.check_orphans(latest, &HashSet::new(), &mut issues)
+            let referenced_files = crate::doctor::referenced_files(valid_manifests.values());
+            self.check_orphans(latest, &referenced_files, &mut issues)
                 .await?;
             return Ok(self.result(issues));
         };
@@ -120,9 +126,11 @@ impl<'a> Checker<'a> {
 
         let schema_opt = self.check_schema(&manifest, &mut issues).await?;
 
-        let referenced_files = self
-            .check_row_groups(&manifest, schema_opt.as_ref(), &mut issues)
+        // Validate row groups from the latest manifest, but orphan detection must
+        // consider the union of files referenced by *all* retained valid snapshots.
+        self.check_row_groups(&manifest, schema_opt.as_ref(), &mut issues)
             .await?;
+        let referenced_files = crate::doctor::referenced_files(valid_manifests.values());
 
         self.check_orphans(latest, &referenced_files, &mut issues)
             .await?;

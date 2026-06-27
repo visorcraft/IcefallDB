@@ -296,7 +296,7 @@ pub async fn checkpoint_locked(storage: &dyn Storage, table: &str) -> Result<boo
     // written) — `parent_manifest_checksum` then scans `_manifests/` for the
     // highest surviving predecessor (the base), keeping the chain intact. `None`
     // (a true anchor) results only at genesis or when every predecessor is gone.
-    let parent = crate::writer::parent_manifest_checksum(storage, table, live.sequence).await?;
+    let parent = crate::metadata::parent_manifest_checksum(storage, table, live.sequence).await?;
     live.finalize(parent, Utc::now().to_rfc3339())?;
 
     let manifest_path = format!("{table}/{}", Manifest::filename(live.sequence));

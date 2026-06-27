@@ -1130,7 +1130,13 @@ impl<'a> Compactor<'a> {
             .await?;
             new_manifest.checkpoint = Some(checkpoint_path);
 
-            new_manifest.checksum = new_manifest.compute_checksum()?;
+            crate::metadata::finalize_manifest(
+                self.storage,
+                &self.table,
+                &mut new_manifest,
+                next_seq,
+            )
+            .await?;
 
             // Write the new manifest snapshot atomically.
             let manifest_data = serde_json::to_vec(&new_manifest)?;

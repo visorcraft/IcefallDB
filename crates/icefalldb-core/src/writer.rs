@@ -4583,9 +4583,8 @@ impl Writer {
     /// highest surviving predecessor. `parent_hash = None` (a true chain anchor)
     /// is produced only at genesis or when every predecessor has been pruned.
     async fn finalize_manifest(&self, manifest: &mut Manifest, next_seq: u64) -> Result<()> {
-        let parent = parent_manifest_checksum(self.storage.as_ref(), &self.table, next_seq).await?;
-        manifest.finalize(parent, chrono::Utc::now().to_rfc3339())?;
-        Ok(())
+        crate::metadata::finalize_manifest(self.storage.as_ref(), &self.table, manifest, next_seq)
+            .await
     }
 
     /// The writer's view of current table state, WAL-aware.
@@ -4757,93 +4756,6 @@ impl Writer {
             .await?;
         self.storage.sync(&format!("{}/", self.table)).await?;
         Ok(())
-    }
-}
-
-/// Checksum of the highest on-disk manifest whose sequence is strictly less than
-/// `next_seq`, or `None` when no such manifest exists (genesis, or every
-/// predecessor pruned by GC). This is the `parent_hash` link for the manifest
-/// being published at `next_seq`, so the snapshot history forms a verified hash
-/// chain even across WAL folds that skip intermediate sequences.
-///
-/// Fast path: the immediate predecessor `<next_seq-1>.json` exists — a single
-/// read, no directory scan (the overwhelming common case, since non-WAL commits
-/// advance the sequence by one). Slow path: that read fails, so we list
-/// `_manifests/` and pick the highest surviving sequence below `next_seq`.
-pub(crate) async fn parent_manifest_checksum(
-    storage: &dyn Storage,
-    table: &str,
-    next_seq: u64,
-) -> Result<Option<String>> {
-    if next_seq <= 1 {
-        return Ok(None); // genesis: no predecessor possible
-    }
-    // Fast path: immediate predecessor on disk.
-    let direct = format!("{}/{}", table, Manifest::filename(next_seq - 1));
-    if let Ok(bytes) = storage.read(&direct).await {
-        match serde_json::from_slice::<Manifest>(&bytes) {
-            Ok(m) => return Ok(Some(m.checksum)),
-            // The predecessor manifest EXISTS but does not deserialize. Anchoring
-            // (`parent_hash = None`) below would make this corruption look like a
-            // legitimately-pruned predecessor; warn so `doctor`/operators can tell
-            // them apart. Control flow is unchanged (fall through to the scan).
-            Err(e) => tracing::warn!(
-                table,
-                path = %direct,
-                error = %e,
-                "predecessor manifest exists but failed to deserialize; the chain \
-                 will anchor here (parent_hash=None) rather than link"
-            ),
-        }
-    }
-    // Slow path: `<next_seq-1>.json` is absent (a WAL fold skipped intermediate
-    // sequences, or GC pruned it). Scan `_manifests/` for the highest surviving
-    // predecessor strictly below `next_seq`.
-    let manifests_dir = format!("{}/_manifests", table);
-    let entries = match storage.list(&manifests_dir).await {
-        Ok(e) => e,
-        Err(e) if is_not_found(&e) => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let mut best: Option<u64> = None;
-    for entry in &entries {
-        let Some(filename) = std::path::Path::new(entry)
-            .file_name()
-            .and_then(|s| s.to_str())
-        else {
-            continue;
-        };
-        let Some(seq_str) = filename.strip_suffix(".json") else {
-            continue; // skips `.json.tmp` and any non-manifest entry
-        };
-        let Ok(seq) = seq_str.parse::<u64>() else {
-            continue;
-        };
-        if seq < next_seq && best.is_none_or(|b| seq > b) {
-            best = Some(seq);
-        }
-    }
-    let Some(pred_seq) = best else {
-        return Ok(None); // all predecessors pruned → true anchor
-    };
-    let pred_path = format!("{}/{}", table, Manifest::filename(pred_seq));
-    match storage.read(&pred_path).await {
-        Ok(bytes) => match serde_json::from_slice::<Manifest>(&bytes) {
-            Ok(m) => Ok(Some(m.checksum)),
-            // Same corruption-vs-pruned ambiguity as the fast path: the
-            // predecessor exists on disk but is unreadable. Warn, then anchor.
-            Err(e) => {
-                tracing::warn!(
-                    table,
-                    path = %pred_path,
-                    error = %e,
-                    "predecessor manifest exists but failed to deserialize; the chain \
-                     will anchor here (parent_hash=None) rather than link"
-                );
-                Ok(None)
-            }
-        },
-        Err(_) => Ok(None),
     }
 }
 

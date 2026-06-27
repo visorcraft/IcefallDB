@@ -1508,20 +1508,31 @@ async fn run_snapshots(db: &Path, table: &str) -> anyhow::Result<()> {
         println!("(no snapshots)");
         return Ok(());
     }
+    let mut any_wal_folded = false;
     for s in snaps {
         let hash = s
             .parent_hash
             .as_deref()
             .map(|h| &h[..h.len().min(16)])
             .unwrap_or("-");
+        let wal_note = if s.wal_folded {
+            any_wal_folded = true;
+            " *"
+        } else {
+            ""
+        };
         println!(
-            "{:>10}  {:<25}  {:>12}  {:>9}  {}",
+            "{:>10}  {:<25}  {:>12}  {:>9}  {}{}",
             s.sequence,
             s.committed_at.unwrap_or_default(),
             s.rows,
             s.fragments,
             hash,
+            wal_note,
         );
+    }
+    if any_wal_folded {
+        println!("* rows include pending mutation WAL deletions");
     }
     Ok(())
 }

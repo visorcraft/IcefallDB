@@ -800,7 +800,9 @@ fn strip_table_prefix(table: &str, path: &str) -> String {
     path.strip_prefix(&prefix).unwrap_or(path).to_string()
 }
 
-fn referenced_files<'a>(manifests: impl Iterator<Item = &'a Manifest>) -> HashSet<String> {
+/// Collect the set of row-group files (data + meta) referenced by any of the
+/// supplied manifests.
+pub fn referenced_files<'a>(manifests: impl Iterator<Item = &'a Manifest>) -> HashSet<String> {
     let mut referenced = HashSet::new();
     for manifest in manifests {
         for entry in &manifest.row_groups {
@@ -809,6 +811,66 @@ fn referenced_files<'a>(manifests: impl Iterator<Item = &'a Manifest>) -> HashSe
         }
     }
     referenced
+}
+
+/// Load all retained valid manifest snapshots and return them keyed by sequence.
+///
+/// Snapshots that cannot be found between listing and reading are silently
+/// skipped. Other I/O errors are propagated. Invalid snapshots (bad JSON,
+/// sequence mismatch, unsupported format version, or checksum failure) are
+/// ignored so callers can treat the retained valid set as authoritative.
+pub async fn retained_valid_manifests(
+    storage: &dyn Storage,
+    table: &str,
+) -> Result<HashMap<u64, Manifest>> {
+    let manifests_dir = format!("{}/_manifests", table);
+    let entries = match storage.list(&manifests_dir).await {
+        Ok(e) => e,
+        Err(e) if is_not_found(&e) => return Ok(HashMap::new()),
+        Err(e) => return Err(e),
+    };
+
+    let mut valid = HashMap::new();
+    for entry in entries {
+        let filename = std::path::Path::new(&entry)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if !filename.ends_with(".json") {
+            continue;
+        }
+        let Some(seq_str) = filename.strip_suffix(".json") else {
+            continue;
+        };
+        let Ok(seq) = seq_str.parse::<u64>() else {
+            continue;
+        };
+
+        let data = match storage.read(&entry).await {
+            Ok(d) => d,
+            Err(e) if is_not_found(&e) => continue,
+            Err(IcefallDBError::Io(e)) => return Err(IcefallDBError::Io(e)),
+            Err(e) => return Err(e),
+        };
+
+        let manifest: Manifest = match serde_json::from_slice(&data) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if manifest.sequence != seq {
+            continue;
+        }
+        if manifest.format_version != 1 {
+            continue;
+        }
+        match manifest.verify_checksum() {
+            Ok(true) => {}
+            Ok(false) | Err(_) => continue,
+        }
+        valid.insert(seq, manifest);
+    }
+
+    Ok(valid)
 }
 
 // ── Chain verification ────────────────────────────────────────────────────

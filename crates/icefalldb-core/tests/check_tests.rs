@@ -5,6 +5,7 @@ use icefalldb_core::metadata::{Column, Manifest, RowGroupMeta, Schema};
 use icefalldb_core::storage::local::LocalStorage;
 use icefalldb_core::storage::Storage;
 use icefalldb_core::writer::{compute_row_group_meta, Writer};
+use icefalldb_core::{Compactor, GarbageCollector};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
@@ -1253,4 +1254,56 @@ async fn test_check_utf8_to_large_utf8_promotion_accepted() {
     let checker = icefalldb_core::Checker::new(&storage, "products");
     let result = checker.check().await.unwrap();
     assert!(result.passed, "issues: {:?}", result.issues);
+}
+
+/// After optimize retains older snapshots, `check` must not warn that files
+/// referenced by those older snapshots are unreferenced. Regression test for M08.
+#[tokio::test]
+async fn test_check_no_orphan_warnings_for_retained_snapshot_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = LocalStorage::new(tmp.path()).unwrap();
+
+    // Build three snapshots so GC can retain snapshots 2 and 3 while snapshot 3
+    // becomes the latest. Each insert creates a new row group file.
+    let schema = make_schema();
+    for ids in [vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]] {
+        let mut writer = Writer::new(Arc::new(storage.clone()), "products", schema.clone())
+            .await
+            .unwrap();
+        writer.insert_batch(make_batch(ids)).await.unwrap();
+        writer.commit().await.unwrap();
+    }
+
+    // Optimize with retain_snapshots=2: snapshots 3 and 4 are retained.
+    // Snapshot 4 (the optimized snapshot) references new compacted row groups,
+    // while retained snapshot 3 still references its original row group files.
+    // Those original files must not be flagged as orphans.
+    let compactor = Compactor::new(&storage, "products");
+    compactor.compact().await.unwrap();
+
+    let gc = GarbageCollector::new(&storage, "products", 2);
+    let gc_result = gc.run().await.unwrap();
+    assert!(
+        gc_result.retained_snapshots.contains(&3),
+        "snapshot 3 should be retained, got {:?}",
+        gc_result.retained_snapshots
+    );
+
+    let checker = icefalldb_core::Checker::new(&storage, "products");
+    let result = checker.check().await.unwrap();
+    assert!(
+        result.passed,
+        "check must pass, got issues: {:?}",
+        result.issues
+    );
+    let orphan_warnings: Vec<_> = result
+        .issues
+        .iter()
+        .filter(|i| i.code == "UNREFERENCED_ROW_GROUP")
+        .collect();
+    assert!(
+        orphan_warnings.is_empty(),
+        "check emitted orphan warnings for files referenced by retained snapshot 3: {:?}",
+        orphan_warnings
+    );
 }
