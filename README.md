@@ -246,12 +246,12 @@ python/.venv/bin/ruff format --check python
 python/.venv/bin/python -m pytest python/tests -q
 ```
 
-`AGENTS.md` is the authoritative source for gates, invariants, and conventions.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the contribution workflow and the
+checks every change must pass.
 
 Benchmark suites live under `python/benchmarks/`: `datafusion/` (query/throughput
 matrix), `mutations/` (write and rewrite cost), and `perf/` (open / commit /
-insert-update cost). Agent and contributor conventions and the format invariants
-are in [`AGENTS.md`](AGENTS.md).
+insert-update cost).
 
 ## Project layout
 
@@ -278,7 +278,7 @@ Full user documentation lives in [`docs/`](docs/):
 - [Using IcefallDB from Python](docs/python.md)
 - [Using IcefallDB from other languages](docs/languages.md)
 - [Encryption](docs/encryption.md)
-- [Agent conventions](AGENTS.md)
+- [Contributing](CONTRIBUTING.md)
 
 ---
 
