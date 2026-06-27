@@ -1405,7 +1405,7 @@ checksum = "cb9e7e5d11130c48c8bd4e80c79a9772dd28ce6dc330baca9246205d245b9e2e"
 
 [[package]]
 name = "datafusion-encrypted-parquet"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2322,7 +2322,7 @@ dependencies = [
 
 [[package]]
 name = "icefalldb-cli"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2343,7 +2343,7 @@ dependencies = [
 
 [[package]]
 name = "icefalldb-core"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "apache-avro",
  "arrow",
@@ -2375,7 +2375,7 @@ dependencies = [
 
 [[package]]
 name = "icefalldb-query"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2404,7 +2404,7 @@ dependencies = [
 
 [[package]]
 name = "icefalldb-query-py"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "arrow",
  "datafusion",
@@ -2417,7 +2417,7 @@ dependencies = [
 
 [[package]]
 name = "icefalldb-server"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "arrow",
  "axum",
